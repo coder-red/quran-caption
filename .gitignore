@@ -1,0 +1,35 @@
+# Secrets — never commit (keys come from env / HF Spaces secrets)
+.env
+.env.*
+!.env.example
+
+# Pipeline outputs / uploads / caches
+temp/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Large media (test clips, uploads, renders) — code + Quran JSON only
+*.mp3
+*.wav
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4a
+*.srt
+*.vtt
+!data/quran_uthmani.json
+!data/quran_en.json
+
+# Logs
+*.log
+
+# Venv / editor
+.venv/
+venv/
+.vscode/
+.idea/
+.streamlit/secrets.toml

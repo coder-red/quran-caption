@@ -1,0 +1,17 @@
+# Slim production stack — $0 hosted ASR (Groq), no torch/transformers.
+# local ASR (whisper + wav2vec2) is NOT needed at deploy time: set
+# ASR_BACKEND=groq + GROQ_API_KEY env vars on the host.
+fastapi==0.141.1
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+soundfile>=0.12.0
+rapidfuzz>=3.6.0
+numpy>=1.24.0
+pydantic>=2.5.0
+streamlit==1.58.0
+starlette==0.47.3
+jinja2>=3.1.0
+imageio-ffmpeg>=0.4.9
+groq>=0.35
+# gemini hosted ASR (free tier, no card) - timestamps are estimates
+google-genai>=1.0
