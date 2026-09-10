@@ -7,3 +7,6 @@ textColor = "#E6EAF2"
 
 [server]
 fileWatcherType = "none"
+# Must cover the app's 400MB cap (Streamlit defaults to 200MB, which
+# would reject large recitations before our own check runs).
+maxUploadSize = 400

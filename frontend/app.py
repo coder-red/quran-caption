@@ -599,6 +599,7 @@ uploaded = st.file_uploader(
     label_visibility="collapsed",
     key="file_uploader",
 )
+st.caption("Big files upload slowly here (free tier, US server) — trim to the passage you want captioned. Max 400MB.")
 if uploaded is not None:
     if uploaded.size > MAX_SIZE:
         st.error("File too large. Maximum 400MB — trim long recordings before uploading on mobile.")
