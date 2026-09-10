@@ -208,14 +208,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div style="text-align:center; font-size:0.8rem; margin:-0.6rem 0 1rem; color:#8B95AB;">
-  <span style="background:#1B2A45; border:1px solid #2E4268; border-radius:999px; padding:0.15rem 0.7rem;">
-    dev build · <b>2026-08-09</b> · opener captions + player fixes
-  </span>
-</div>
-""", unsafe_allow_html=True)
-
 MAX_SIZE = 400 * 1024 * 1024
 
 PRESETS = {
