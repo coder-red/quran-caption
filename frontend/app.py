@@ -257,6 +257,7 @@ ss.setdefault("styles", dict(PRESETS["Classic"]))
 ss.setdefault("preset", "Classic")
 ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
+ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
 
 
@@ -540,32 +541,44 @@ if (wrap) {{
 
 
 def ensure_media():
+    """Resolve a playable preview for the server-side media copy.
+
+    The file is uploaded ONCE (at Generate time); this only resolves the
+    URL / data-URI, falling back to a one-time upload for legacy sessions
+    or after an engine restart wiped the server copy."""
     if ss["media_url"] is not None or ss.get("media_data_uri"):
         return
     if ss["file_bytes"] is None or ss["media_id"] is None:
         return
-    try:
-        resp = requests.post(
-            f"{API_URL}/media/{ss['media_id']}",
-            files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
-            timeout=300,
-        )
-        if resp.status_code == 200:
-            if DEPLOYED:
-                try:
-                    pv = requests.get(f"{API_URL}/media/{ss['media_id']}/preview", timeout=1200)
-                    if pv.status_code == 200 and pv.content:
-                        ss["media_data_uri"] = "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
-                    else:
-                        st.warning("Video preview unavailable on this instance.")
-                except requests.RequestException as e:
-                    st.warning(f"Video preview unavailable: {e}")
+    if not ss.get("media_uploaded"):
+        try:
+            resp = requests.post(
+                f"{API_URL}/media/{ss['media_id']}",
+                files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
+                timeout=300,
+            )
+            if resp.status_code != 200:
+                st.warning(f"Video preview unavailable: {api_error(resp)}")
+                return
+            ss["media_uploaded"] = True
+        except requests.RequestException as e:
+            st.warning(f"Video preview unavailable: {e}")
+            return
+    if DEPLOYED:
+        try:
+            pv = requests.get(f"{API_URL}/media/{ss['media_id']}/preview", timeout=1200)
+            if pv.status_code == 200 and pv.content:
+                ss["media_data_uri"] = "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
+            elif pv.status_code == 404:
+                # Engine restarted and lost the copy — re-upload next run.
+                ss["media_uploaded"] = False
+                st.warning("Video preview unavailable: engine restarted, press Generate Captions again.")
             else:
-                ss["media_url"] = PUBLIC_URL + resp.json()["url"]
-        else:
-            st.warning(f"Video preview unavailable: {api_error(resp)}")
-    except requests.RequestException as e:
-        st.warning(f"Video preview unavailable: {e}")
+                st.warning("Video preview unavailable on this instance.")
+        except requests.RequestException as e:
+            st.warning(f"Video preview unavailable: {e}")
+    else:
+        ss["media_url"] = PUBLIC_URL + f"/media/{ss['media_id']}"
 
 
 def show_detection(result: dict):
@@ -618,18 +631,34 @@ if uploaded is not None:
         ss["render_job_id"] = None
         ss["media_id"] = uuid.uuid4().hex[:10]
         ss["media_url"] = None
+        ss["media_data_uri"] = None
+        ss["media_uploaded"] = False
 
 if ss["file_bytes"] is not None and ss["align_result"] is None:
     st.video(ss["file_bytes"])
 
     generate = st.button("Generate Captions", type="primary", use_container_width=True)
     if generate:
+        if not ss.get("media_id"):
+            ss["media_id"] = uuid.uuid4().hex[:10]
         with st.status("Running speech recognition + surah detection…", expanded=True) as status:
             try:
+                # Upload ONCE: the file goes to /media, then /align reuses
+                # that server-side copy via media_id (no second upload).
+                if not ss.get("media_uploaded"):
+                    status.update(label="Uploading file (once)…", state="running")
+                    up = requests.post(
+                        f"{API_URL}/media/{ss['media_id']}",
+                        files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
+                        timeout=300,
+                    )
+                    if up.status_code != 200:
+                        st.error(f"Upload failed: {api_error(up)}")
+                        st.stop()
+                    ss["media_uploaded"] = True
                 resp = requests.post(
                     f"{API_URL}/align",
-                    files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
-                    data={"job": "1"},
+                    data={"job": "1", "media_id": ss["media_id"]},
                     timeout=120,
                 )
             except requests.RequestException as e:
@@ -740,17 +769,36 @@ if ss["align_result"] is not None and ss["segments"]:
 
     render_clicked = st.button("Render MP4 with captions", type="primary", use_container_width=True)
     if render_clicked:
+        # Render reuses the server-side copy (uploaded once at Generate
+        # time) — no second upload. If the engine restarted since, upload
+        # once more first.
+        if not ss.get("media_uploaded"):
+            try:
+                up = requests.post(
+                    f"{API_URL}/media/{ss['media_id']}",
+                    files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
+                    timeout=300,
+                )
+                if up.status_code != 200:
+                    st.error(f"Upload failed: {api_error(up)}")
+                    st.stop()
+                ss["media_uploaded"] = True
+            except requests.RequestException as e:
+                st.error(f"Could not upload for render: {e}")
+                st.stop()
         try:
             resp = requests.post(
                 f"{API_URL}/render",
-                files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
-                data=style_payload({"srt": srt_content, "width": res_w, "height": res_h} if res_w else {"srt": srt_content}),
+                data=style_payload({"media_id": ss["media_id"], "srt": srt_content, "width": res_w, "height": res_h} if res_w else {"media_id": ss["media_id"], "srt": srt_content}),
                 timeout=180,
             )
         except requests.RequestException as e:
             st.error(f"Could not start render: {e}")
         else:
-            if resp.status_code != 200:
+            if resp.status_code == 404:
+                ss["media_uploaded"] = False
+                st.error("Engine lost the uploaded copy (restarted) — press Render again to re-upload once.")
+            elif resp.status_code != 200:
                 st.error(f"Render failed to start: {api_error(resp)}")
             else:
                 ss["render_job_id"] = resp.json()["job_id"]

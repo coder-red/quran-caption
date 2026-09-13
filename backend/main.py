@@ -53,9 +53,20 @@ app = FastAPI(
 )
 
 
+def _media_path_or_404(media_id: str) -> str:
+    """Resolve a stored /media upload or 404 (engine restarted / unknown id).
+    Lets /align and /render reuse the server-side copy so the client uploads
+    the file ONCE instead of once per endpoint."""
+    path = MEDIA_FILES.get(media_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Media not found — re-upload the file")
+    return path
+
+
 @app.post("/align", response_model=AlignResponse | ErrorResponse | dict)
 def align_audio(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    media_id: str = Form(None),
     duration: float = Form(None),
     fps: float = Form(None),
     width: int = Form(None),
@@ -67,10 +78,21 @@ def align_audio(
     (job=1): returns {"job_id"} immediately, work runs in a background thread,
     progress via GET /align/status/{id}, result via GET /align/result/{id} —
     mirrors /render so the UI can show a progress bar (long clips take
-    minutes)."""
+    minutes).
+
+    Upload once: pass media_id from an earlier POST /media/{id} instead of
+    re-uploading the file — the server reuses its stored copy."""
     if job:
         _purge_old_align_jobs()
-        content = file.file.read()
+        if file is not None and getattr(file, "filename", None):
+            content = file.file.read()
+            filename = file.filename or "audio"
+            media_path = None
+        elif media_id:
+            media_path = _media_path_or_404(media_id)
+            content, filename = None, None
+        else:
+            raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
         jid = uuid.uuid4().hex
         ALIGN_JOBS[jid] = {
             "status": "queued",
@@ -82,12 +104,17 @@ def align_audio(
         }
         threading.Thread(
             target=_align_job_worker,
-            args=(jid, content, file.filename or "audio", duration, fps,
+            args=(jid, content, filename, media_path, duration, fps,
                   width, height, asr_backend),
             daemon=True,
         ).start()
         return {"job_id": jid, "status": "queued"}
-    return _align_impl(file, duration, fps, width, height, asr_backend)
+    if file is not None and getattr(file, "filename", None):
+        return _align_impl(file, duration, fps, width, height, asr_backend)
+    if media_id:
+        return _align_impl(None, duration, fps, width, height, asr_backend,
+                           media_path=_media_path_or_404(media_id))
+    raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
 
 
 def _align_impl(
@@ -98,39 +125,50 @@ def _align_impl(
     height: int | None = None,
     asr_backend: str | None = None,
     p=None,
+    media_path: str | None = None,
 ):
     """Shared align pipeline (sync path + background job worker). p: optional
-    callable(stage: str, percent: float) for UI progress reporting."""
+    callable(stage: str, percent: float) for UI progress reporting.
+    media_path: reuse a stored /media copy (owned=False — never deleted)."""
     audio_path = None
     sliced_path = None
     temp_slices = []
+    owned = media_path is None
 
     def setp(stage: str, pct: float):
         if p:
             p(stage, pct)
 
     try:
-        ext = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
-        audio_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}{ext}")
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        with open(audio_path, "wb") as f:
-            content = file.file.read()
-            f.write(content)
+        if media_path:
+            audio_path = media_path
+            os.makedirs(TEMP_DIR, exist_ok=True)
+        elif file is not None:
+            ext = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+            audio_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}{ext}")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            with open(audio_path, "wb") as f:
+                content = file.file.read()
+                f.write(content)
+        else:
+            return ErrorResponse(error="Upload a file or pass media_id")
 
         if audio_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
             old_path = audio_path
             audio_path, _ = asr_engine.extract_audio(old_path)
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
+            if owned:
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
         elif not audio_path.lower().endswith(".wav"):
             old_path = audio_path
             audio_path, _ = asr_engine.extract_audio(old_path)
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
+            if owned:
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
 
         import soundfile as sf
         from backend.vad import get_speech_segments, merge_segments, chunk_for_whisper, speech_span, silence_runs_from_segments
@@ -318,7 +356,7 @@ def _align_impl(
                     os.remove(p)
                 except OSError:
                     pass
-        if audio_path and os.path.exists(audio_path):
+        if owned and audio_path and os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
             except OSError:
@@ -351,6 +389,7 @@ def _align_job_worker(
     jid: str,
     content: bytes,
     filename: str,
+    media_path: str | None,
     duration: float | None,
     fps: float | None,
     width: int | None,
@@ -365,10 +404,16 @@ def _align_job_worker(
         job["progress"] = round(float(pct), 1)
 
     try:
-        result = _align_impl(
-            _JobUpload(filename, content), duration, fps, width, height,
-            asr_backend, p=p,
-        )
+        if media_path:
+            result = _align_impl(
+                None, duration, fps, width, height,
+                asr_backend, p=p, media_path=media_path,
+            )
+        else:
+            result = _align_impl(
+                _JobUpload(filename, content), duration, fps, width, height,
+                asr_backend, p=p,
+            )
         dumps = result.model_dump()
         job["result"] = dumps
         job["status"] = "error" if "error" in dumps else "done"
@@ -602,6 +647,7 @@ def _render_job_worker(
     styles: dict,
     width: int | None,
     height: int | None,
+    cleanup_input: bool = True,
 ):
     job = RENDER_JOBS[job_id]
     try:
@@ -628,11 +674,12 @@ def _render_job_worker(
         job["status"] = "error"
         job["error"] = str(e)
     finally:
-        try:
-            if os.path.exists(video_path):
-                os.remove(video_path)
-        except OSError:
-            pass
+        if cleanup_input:
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except OSError:
+                pass
 
 
 def _purge_old_jobs():
@@ -651,7 +698,8 @@ def _purge_old_jobs():
 
 @app.post("/render")
 async def render_video(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    media_id: str = Form(None),
     srt: str = Form(...),
     width: int = Form(None),
     height: int = Form(None),
@@ -667,12 +715,19 @@ async def render_video(
 ):
     _purge_old_jobs()
     video_path = None
+    cleanup_input = True
     try:
-        ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-        video_path = os.path.join(TEMP_DIR, f"input_{uuid.uuid4()}{ext}")
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        with open(video_path, "wb") as f:
-            f.write(await file.read())
+        if file is not None and getattr(file, "filename", None):
+            ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+            video_path = os.path.join(TEMP_DIR, f"input_{uuid.uuid4()}{ext}")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            with open(video_path, "wb") as f:
+                f.write(await file.read())
+        elif media_id:
+            video_path = _media_path_or_404(media_id)
+            cleanup_input = False
+        else:
+            raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
 
         styles = _parse_style_form(
             font_size=font_size,
@@ -698,14 +753,16 @@ async def render_video(
 
         thread = threading.Thread(
             target=_render_job_worker,
-            args=(job_id, video_path, srt, styles, width, height),
+            args=(job_id, video_path, srt, styles, width, height, cleanup_input),
             daemon=True,
         )
         thread.start()
 
         return {"job_id": job_id, "status": "queued"}
+    except HTTPException:
+        raise
     except Exception as e:
-        if video_path and os.path.exists(video_path):
+        if cleanup_input and video_path and os.path.exists(video_path):
             try:
                 os.remove(video_path)
             except OSError:
