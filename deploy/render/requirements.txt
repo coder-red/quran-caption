@@ -1,0 +1,28 @@
+# Render free-tier stack (512MB RAM): hosted ASR only, NO torch.
+# Root requirements.txt keeps torch/transformers for local dev (ASR_BACKEND=local
+# fallback + wav2vec2 forced alignment). Render cannot fit those in 512MB
+# alongside Streamlit, which is what caused the OOM kills on Generate.
+# Point the Render service Build Command at this file:
+#   pip install -r deploy/render/requirements.txt
+# Then set env: ASR_BACKEND=groq + GROQ_API_KEY (+ optional GEMINI/ELEVENLABS keys).
+# Neural VAD runs torch-free via vendored Silero ONNX weights
+# (backend/silero_vad.onnx) + onnxruntime; without the .onnx file it falls
+# back to energy VAD (works, coarser pauses).
+fastapi==0.141.1
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+soundfile>=0.12.0
+rapidfuzz>=3.6.0
+numpy>=1.24.0
+pydantic>=2.5.0
+streamlit==1.58.0
+starlette==0.47.3
+jinja2>=3.1.0
+imageio-ffmpeg>=0.4.9
+pandas>=2.0.0
+requests>=2.31.0
+groq>=0.35
+elevenlabs>=2.0.0
+onnxruntime>=1.17.0
+# gemini hosted ASR (free tier, no card) - timestamps are estimates
+google-genai>=1.0
