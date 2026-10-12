@@ -216,7 +216,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-MAX_SIZE = 400 * 1024 * 1024
+MAX_SIZE = int(os.environ.get("QCAP_MAX_MB", "400")) * 1024 * 1024
 
 PRESETS = {
     "Classic": {"font_size": 48, "font_family": "Segoe UI", "font_color": "#FFFFFF",
@@ -565,6 +565,29 @@ if (wrap) {{
 """
 
 
+def media_bytes():
+    """File bytes for a (re-)upload to /media.
+
+    Session bytes are dropped right after the first successful upload (they
+    would otherwise pin the whole file in RAM forever — a 400MB clip plus
+    Streamlit plus the API child does not fit a 512MB host). Re-reads from
+    the uploader widget when needed (engine restart / legacy session)."""
+    if ss.get("file_bytes") is not None:
+        return ss["file_bytes"]
+    up = st.session_state.get("file_uploader")
+    if up is None:
+        return None
+    try:
+        return up.getvalue()
+    except Exception:
+        return None
+
+
+def drop_media_bytes():
+    """Free the session file copy after /media accepted it."""
+    ss["file_bytes"] = None
+
+
 def ensure_media():
     """Resolve a playable preview for the server-side media copy.
 
@@ -573,19 +596,24 @@ def ensure_media():
     or after an engine restart wiped the server copy."""
     if ss["media_url"] is not None or ss.get("media_data_uri"):
         return
-    if ss["file_bytes"] is None or ss["media_id"] is None:
+    if ss["media_id"] is None:
         return
     if not ss.get("media_uploaded"):
+        payload = media_bytes()
+        if payload is None:
+            st.warning("Video preview unavailable: re-select the file to upload it again.")
+            return
         try:
             resp = requests.post(
                 f"{API_URL}/media/{ss['media_id']}",
-                files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
+                files={"file": (ss["file_meta"]["name"], payload, ss["file_meta"]["type"])},
                 timeout=300,
             )
             if resp.status_code != 200:
                 st.warning(f"Video preview unavailable: {api_error(resp)}")
                 return
             ss["media_uploaded"] = True
+            drop_media_bytes()
         except requests.RequestException as e:
             st.warning(f"Video preview unavailable: {e}")
             return
@@ -637,10 +665,10 @@ uploaded = st.file_uploader(
     label_visibility="collapsed",
     key="file_uploader",
 )
-st.caption("Big files upload slowly here (free tier, US server) — trim to the passage you want captioned. Max 400MB.")
+st.caption(f"Big files upload slowly here (free tier, US server) — trim to the passage you want captioned. Max {MAX_SIZE // (1024 * 1024)}MB.")
 if uploaded is not None:
     if uploaded.size > MAX_SIZE:
-        st.error("File too large. Maximum 400MB — trim long recordings before uploading on mobile.")
+        st.error(f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — trim long recordings before uploading on mobile.")
         st.stop()
     is_new = (
         ss["file_meta"] is None
@@ -659,8 +687,13 @@ if uploaded is not None:
         ss["media_data_uri"] = None
         ss["media_uploaded"] = False
 
-if ss["file_bytes"] is not None and ss["align_result"] is None:
-    st.video(ss["file_bytes"])
+if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_result"] is None:
+    if ss["file_bytes"] is not None:
+        st.video(ss["file_bytes"])
+    else:
+        # Bytes were dropped after upload to save RAM; the server copy is
+        # reused, so just offer Generate again (e.g. after a failed run).
+        st.info("File is already on the caption engine — press Generate Captions to (re)run.")
 
     ss["asr_backend"] = st.selectbox(
         "Transcription engine",
@@ -681,15 +714,20 @@ if ss["file_bytes"] is not None and ss["align_result"] is None:
                 # that server-side copy via media_id (no second upload).
                 if not ss.get("media_uploaded"):
                     status.update(label="Uploading file (once)…", state="running")
+                    payload = media_bytes()
+                    if payload is None:
+                        st.error("Upload failed: file bytes unavailable — re-select the file.")
+                        st.stop()
                     up = requests.post(
                         f"{API_URL}/media/{ss['media_id']}",
-                        files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
+                        files={"file": (ss["file_meta"]["name"], payload, ss["file_meta"]["type"])},
                         timeout=300,
                     )
                     if up.status_code != 200:
                         st.error(f"Upload failed: {api_error(up)}")
                         st.stop()
                     ss["media_uploaded"] = True
+                    drop_media_bytes()
                 resp = requests.post(
                     f"{API_URL}/align",
                     data={"job": "1", "media_id": ss["media_id"],
@@ -715,7 +753,14 @@ if ss["file_bytes"] is not None and ss["align_result"] is None:
                     text=f"{job.get('stage', 'working…')} · {job.get('progress', 0):.0f}%",
                 )
                 if job.get("status") == "error":
-                    st.error(f"Align failed: {job.get('error') or 'unknown error'}")
+                    # /align/status carries no message — fetch it from the
+                    # result endpoint (now surfaces the real job error).
+                    msg = None
+                    try:
+                        msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
+                    except requests.RequestException:
+                        msg = None
+                    st.error(f"Align failed: {msg or 'unknown error'}")
                     st.stop()
                 if job.get("status") == "done":
                     break
@@ -808,16 +853,21 @@ if ss["align_result"] is not None and ss["segments"]:
         # time) — no second upload. If the engine restarted since, upload
         # once more first.
         if not ss.get("media_uploaded"):
+            payload = media_bytes()
+            if payload is None:
+                st.error("Upload failed: file bytes unavailable — re-select the file.")
+                st.stop()
             try:
                 up = requests.post(
                     f"{API_URL}/media/{ss['media_id']}",
-                    files={"file": (ss["file_meta"]["name"], ss["file_bytes"], ss["file_meta"]["type"])},
+                    files={"file": (ss["file_meta"]["name"], payload, ss["file_meta"]["type"])},
                     timeout=300,
                 )
                 if up.status_code != 200:
                     st.error(f"Upload failed: {api_error(up)}")
                     st.stop()
                 ss["media_uploaded"] = True
+                drop_media_bytes()
             except requests.RequestException as e:
                 st.error(f"Could not upload for render: {e}")
                 st.stop()
