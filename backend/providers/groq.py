@@ -28,6 +28,13 @@ MAX_REQUEST_SECONDS = 240.0
 SAMPLE_RATE = 16000
 MAX_RETRIES = 3
 
+# Safety cap on the per-word VAD-anchor correction: Whisper stamp drift
+# rarely exceeds ~0.5s, so a bigger implied shift means the word was
+# mis-associated with the slice (e.g. hallucinated words in silence) and
+# dragging it by seconds would be wrong. Phrase-boundary truth comes from
+# the VAD clamp in segmenter._phrase_split instead.
+MAX_ANCHOR_SHIFT = 0.6
+
 
 class GroqProvider(ASRProvider):
     name = "groq"
@@ -51,7 +58,16 @@ class GroqProvider(ASRProvider):
         return self._client
 
     def transcribe(self, audio_path: str, slices=None, language: str = "ar",
-                   progress_cb: Optional[callable] = None) -> dict:
+                   progress_cb: Optional[callable] = None,
+                   anchor_slices=None,
+                   speech_segs=None) -> dict:
+        """slices: merged VAD spans used to pack API requests. anchor_slices:
+        raw (unmerged) VAD segments used for the drift correction — anchoring
+        per breath-delimited segment keeps the correction local instead of
+        smearing non-uniform Whisper drift across minutes (measured: 5-min
+        merged slices left per-word residuals up to ~1s). speech_segs: raw
+        VAD segments used to cut over-long requests on silence instead of an
+        arbitrary time mark. Both default to slices (legacy behavior)."""
         wav_path = self._ensure_16k_mono(audio_path)
         try:
             audio, sr = sf.read(wav_path, dtype="float32")
@@ -65,7 +81,7 @@ class GroqProvider(ASRProvider):
             dur = len(audio) / SAMPLE_RATE
             if dur < 0.5:
                 raise RuntimeError("audio too short to transcribe")
-            bounds = self._plan_bounds(slices, dur)
+            bounds = self._plan_bounds(slices, dur, speech_segs)
             words = []
             n_bounds = len(bounds)
             for i, (s, e) in enumerate(bounds):
@@ -73,7 +89,7 @@ class GroqProvider(ASRProvider):
                 if progress_cb:
                     progress_cb(round(100.0 * (i + 1) / n_bounds))
             words.sort(key=lambda w: w["start"])
-            _anchor_words_to_vad(words, slices)
+            _anchor_words_to_vad(words, anchor_slices or slices)
             transcript = " ".join(w["text"] for w in words).strip()
             return {
                 "transcript": transcript,
@@ -104,8 +120,12 @@ class GroqProvider(ASRProvider):
         return out
 
     @staticmethod
-    def _plan_bounds(slices, dur: float) -> list[tuple[float, float]]:
-        """Pack VAD slices into requests of <= MAX_REQUEST_SECONDS."""
+    def _plan_bounds(slices, dur: float, speech=None) -> list[tuple[float, float]]:
+        """Pack VAD slices into requests of <= MAX_REQUEST_SECONDS. speech:
+        raw (unmerged) VAD segments — when a span exceeds the cap it is cut
+        at the latest speech-segment end inside the window instead of an
+        arbitrary time mark, so requests never split mid-word/mid-ayah.
+        Without speech data the cut falls back to the exact cap mark."""
         if slices:
             plan = []
             cur_s = cur_e = None
@@ -121,8 +141,10 @@ class GroqProvider(ASRProvider):
                     plan.append((cur_s, cur_e))
                     cur_s, cur_e = s, e
                 while cur_e - cur_s > MAX_REQUEST_SECONDS:
-                    plan.append((cur_s, cur_s + MAX_REQUEST_SECONDS))
-                    cur_s += MAX_REQUEST_SECONDS
+                    cut = _silence_cut(speech, cur_s,
+                                       cur_s + MAX_REQUEST_SECONDS)
+                    plan.append((cur_s, cut))
+                    cur_s = cut
             if cur_s is not None:
                 plan.append((cur_s, cur_e))
             if plan:
@@ -206,7 +228,28 @@ class GroqProvider(ASRProvider):
         raise RuntimeError(f"groq transcription failed: {last_err}")
 
 
-def _anchor_words_to_vad(words: list[dict], slices: list[tuple[float, float]]):
+def _silence_cut(speech, span_start: float, hard_cut: float) -> float:
+    """Latest speech-segment end in [span_start + 60% of the cap window,
+    hard_cut] — cutting a request there lands on real silence. Falls back
+    to hard_cut when no segment edge qualifies (always makes progress)."""
+    cut = hard_cut
+    if speech:
+        lo = span_start + 0.6 * (hard_cut - span_start)
+        for s, e in speech:
+            if lo <= e <= hard_cut and e > span_start:
+                cut = e
+    return cut if cut > span_start else hard_cut
+
+
+def _plan_bounds_request(slices, dur: float, speech=None) -> list[tuple[float, float]]:
+    """Shared request-packing for hosted providers (groq, elevenlabs):
+    pack VAD slices into <= MAX_REQUEST_SECONDS requests, cutting over-long
+    spans on silence when raw speech segments are given."""
+    return GroqProvider._plan_bounds(slices, dur, speech)
+
+
+def _anchor_words_to_vad(words: list[dict], slices: list[tuple[float, float]],
+                         max_shift: float = MAX_ANCHOR_SHIFT):
     """Whisper word timestamps lag/lead true speech onset by ~0.3-0.5s (they are
     snapped to the model's ~20ms token grid), which reads as 'caption appears
     before the voice'. The reliable reference is the Silero VAD slice bounds:
@@ -216,6 +259,15 @@ def _anchor_words_to_vad(words: list[dict], slices: list[tuple[float, float]]):
     Apply a linear two-anchor drift correction per VAD slice (start->word[0],
     end->word[-1]), interpolated by position — same technique pro caption tools
     use for drift. Measured on a real recitation: |err| drops 0.45s -> 0.03s.
+
+    Callers should pass RAW (unmerged) VAD segments: the correction is only
+    valid over breath-delimited spans with no internal pauses. The per-word
+    offset is capped at max_shift (default MAX_ANCHOR_SHIFT) — a bigger
+    implied shift means the word was mis-associated with the slice, and
+    phrase-boundary truth comes from the VAD clamp in
+    segmenter._phrase_split instead. Precise providers (ElevenLabs Scribe,
+    ~50ms boundaries) pass a tighter cap so good stamps are never dragged
+    toward a dubious VAD bound.
     """
     if not slices or not words:
         return
@@ -239,5 +291,6 @@ def _anchor_words_to_vad(words: list[dict], slices: list[tuple[float, float]]):
         for k, w in enumerate(seg):
             frac = (w["start"] - s) / span
             off = d_start + frac * (d_end - d_start)
+            off = max(-max_shift, min(max_shift, off))
             w["start"] = round(w["start"] + off, 3)
             w["end"] = round(w["end"] + off, 3)

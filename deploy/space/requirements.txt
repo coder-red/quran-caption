@@ -1,6 +1,9 @@
 # Slim production stack — $0 hosted ASR (Groq), no torch/transformers.
 # local ASR (whisper + wav2vec2) is NOT needed at deploy time: set
 # ASR_BACKEND=groq + GROQ_API_KEY env vars on the host.
+# Neural VAD runs torch-free via vendored Silero ONNX weights
+# (backend/silero_vad.onnx) + onnxruntime. Scribe provider is opt-in
+# (ELEVENLABS_API_KEY space secret).
 fastapi==0.141.1
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.6
@@ -13,5 +16,7 @@ starlette==0.47.3
 jinja2>=3.1.0
 imageio-ffmpeg>=0.4.9
 groq>=0.35
+elevenlabs>=2.0.0
+onnxruntime>=1.17.0
 # gemini hosted ASR (free tier, no card) - timestamps are estimates
 google-genai>=1.0

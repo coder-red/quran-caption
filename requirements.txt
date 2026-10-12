@@ -18,5 +18,7 @@ datasets>=2.18.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0
 silero-vad>=5.1.0
+onnxruntime>=1.17.0
 groq>=0.35
+elevenlabs>=2.0.0
 openai>=1.30.0

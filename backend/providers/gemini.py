@@ -8,14 +8,17 @@ per-request size cap once audio is chunked locally.
 
 Strategy (matches the official long-audio recipes: slice, transcribe, offset):
 - Convert to 16kHz mono WAV once (like the groq provider).
-- Pack VAD slices into chunks of <= MAX_REQUEST_SECONDS (10 min) with a small
-  overlap so no word is cut at a boundary.
-- Each chunk is reduced to 16k mono FLAC (~8MB/10min, under the 20MB inline
-  cap) and sent INLINE with JSON-mode output requesting word-level
+- Pack VAD slices into chunks of <= MAX_REQUEST_SECONDS (2 min) with a small
+  overlap so no word is cut at a boundary. Short chunks keep every upload
+  small (slow uplinks stall for seconds, not minutes, per request), give the
+  UI per-chunk progress instead of one frozen bar, and dodge the giant-
+  request 503s that trigger minutes of blind backoff sleep.
+- Each chunk is reduced to 16k mono FLAC (~1MB/2min, far under the 20MB
+  inline cap) and sent INLINE with JSON-mode output requesting word-level
   timestamps. Gemini returns estimated word times (not true per-word CTC
   frames), which `_anchor_words_to_vad` corrects against the VAD slice bounds.
-- Sequential calls stay well under every free-tier quota; a full 2h05m surah
-  is ~13 small requests and finishes in minutes instead of an hour.
+- Sequential calls stay well under every free-tier quota; an 8-min clip is
+  ~5 small requests and finishes in a couple of minutes.
 """
 import json
 import math
@@ -41,12 +44,17 @@ try:
 except Exception:  # pragma: no cover
     _genai_mod = None
 
-MAX_REQUEST_SECONDS = 600.0
+MAX_REQUEST_SECONDS = 120.0
 OVERLAP_SECONDS = 8.0
 SAMPLE_RATE = 16000
 MAX_RETRIES = 5
 
 _RETRY_WAIT = (10.0, 20.0, 40.0, 80.0, 160.0)
+# Overload (503/high-demand) backoff is deliberately SHORTER than it used to
+# be (was 30/60/120/240/480s): with 2-min chunks a retry re-sends little, so
+# waiting 8 min blind for one attempt is never worth it — and every wait is
+# now reported to the UI via on_retry so the progress bar never looks dead.
+_OVERLOAD_WAIT = (15.0, 30.0, 60.0, 120.0, 240.0)
 
 
 class _ParseError(RuntimeError):
@@ -71,10 +79,19 @@ class GeminiProvider(ASRProvider):
                     "https://aistudio.google.com/app/apikey and set GEMINI_API_KEY "
                     "(or ASR_BACKEND=groq for the free hosted path)"
                 )
-            self._client = _genai_mod.Client(api_key=self.api_key)
+            try:
+                # Finite per-request timeout (ms): a hung connection must fail
+                # into the retry loop, never stall the job thread forever.
+                self._client = _genai_mod.Client(
+                    api_key=self.api_key, http_options={"timeout": 300000})
+            except TypeError:
+                self._client = _genai_mod.Client(api_key=self.api_key)
         return self._client
 
-    def transcribe(self, audio_path: str, slices=None, language: str = "ar") -> dict:
+    def transcribe(self, audio_path: str, slices=None, language: str = "ar",
+                   anchor_slices=None, speech_segs=None,
+                   progress_cb: Optional[callable] = None,
+                   on_retry: Optional[callable] = None) -> dict:
         wav_path = self._ensure_16k_mono(audio_path)
         try:
             audio, sr = sf.read(wav_path, dtype="float32")
@@ -90,15 +107,19 @@ class GeminiProvider(ASRProvider):
                 raise RuntimeError("audio too short to transcribe")
             bounds = self._plan_chunks(slices, dur)
             words = []
+            n_bounds = len(bounds)
             for i, (s, e) in enumerate(bounds):
-                chunk_words = self._call_or_shrink(audio, s, e)
+                chunk_words = self._call_or_shrink(audio, s, e,
+                                                   on_retry=on_retry)
                 for w in chunk_words:
                     w["_chunk"] = i
                 words.extend(chunk_words)
+                if progress_cb:
+                    progress_cb(round(100.0 * (i + 1) / n_bounds))
                 time.sleep(1.0)  # gentle pacing; free tier is ~15 rpm
             words = self._dedupe_overlaps(words, bounds)
             words.sort(key=lambda w: w["start"])
-            _anchor_words_to_vad(words, slices)
+            _anchor_words_to_vad(words, anchor_slices or slices)
             transcript = " ".join(w["text"] for w in words).strip()
             return {
                 "transcript": transcript,
@@ -176,7 +197,8 @@ class GeminiProvider(ASRProvider):
             out.append(w)
         return out
 
-    def _call(self, audio: np.ndarray, s: float, e: float) -> list[dict]:
+    def _call(self, audio: np.ndarray, s: float, e: float,
+              on_retry=None) -> list[dict]:
         lo = max(0, int(s * SAMPLE_RATE))
         hi = min(len(audio), int(e * SAMPLE_RATE))
         seg = audio[lo:hi]
@@ -196,10 +218,10 @@ class GeminiProvider(ASRProvider):
             except OSError:
                 pass
 
-        res = self._generate(flac_bytes)
+        res = self._generate(flac_bytes, on_retry=on_retry)
         return self._parse_words(res, s)
 
-    def _generate(self, flac_bytes: bytes):
+    def _generate(self, flac_bytes: bytes, on_retry=None):
         last_err = None
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -235,9 +257,15 @@ class GeminiProvider(ASRProvider):
                 msg = str(exc).lower()
                 overload = "503" in msg or "unavailable" in msg or "high demand" in msg
                 if attempt < MAX_RETRIES:
-                    wait = _RETRY_WAIT[attempt]
-                    if overload:
-                        wait = max(wait, 30.0 * (2 ** attempt))
+                    wait = (_OVERLOAD_WAIT[attempt] if overload
+                            else _RETRY_WAIT[attempt])
+                    if on_retry:
+                        try:
+                            on_retry(
+                                f"Gemini busy ({'overloaded' if overload else 'rate-limited'}), "
+                                f"retrying in {wait:.0f}s… (attempt {attempt + 2}/{MAX_RETRIES + 1})")
+                        except Exception:
+                            pass
                     time.sleep(wait)
                     continue
                 raise RuntimeError(f"gemini transcription failed: {exc}") from exc
@@ -267,24 +295,30 @@ class GeminiProvider(ASRProvider):
         return out
 
     def _call_or_shrink(self, audio: np.ndarray, s: float, e: float,
-                        depth: int = 0) -> list[dict]:
+                        depth: int = 0, on_retry=None) -> list[dict]:
         """Call _call for [s,e); if Gemini answers but the words are
         unparseable (likely an output-cap issue), bisect and retry each
         half. Transport errors (429/503 overload) are NOT bisected — they
         are model-side and retried with backoff inside _generate."""
         try:
-            return self._call(audio, s, e)
+            return self._call(audio, s, e, on_retry=on_retry)
         except _ParseError:
             if depth >= 3 or e - s < 30.0:
                 raise
             mid = (s + e) / 2
-            out = self._call_or_shrink(audio, s, mid, depth + 1)
-            out.extend(self._call_or_shrink(audio, mid, e, depth + 1))
+            out = self._call_or_shrink(audio, s, mid, depth + 1,
+                                       on_retry=on_retry)
+            out.extend(self._call_or_shrink(audio, mid, e, depth + 1,
+                                            on_retry=on_retry))
             return out
 
 
-def _anchor_words_to_vad(words: list[dict], slices: list[tuple[float, float]]):
+def _anchor_words_to_vad(words: list[dict], slices: list[tuple[float, float]],
+                         max_shift: float | None = None):
     """Same drift correction as the groq provider: linearly snap the first word
     of each VAD slice to the slice onset and the last word to its end."""
-    from backend.providers.groq import _anchor_words_to_vad as _anchor
-    _anchor(words, slices)
+    from backend.providers.groq import (
+        _anchor_words_to_vad as _anchor, MAX_ANCHOR_SHIFT,
+    )
+    _anchor(words, slices,
+            max_shift=MAX_ANCHOR_SHIFT if max_shift is None else max_shift)

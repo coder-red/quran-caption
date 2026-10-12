@@ -178,6 +178,9 @@ div[data-testid="stPills"], div[data-baseweb="segmented-control"] { flex-wrap: w
 /* Caption player: keep 16:9 but cap height on short screens so controls stay visible */
 #capwrap { max-height: 72vh; }
 #capwrap video { max-height: 72vh; object-fit: contain; background: #000; }
+/* Sticky mini-player: stays pinned while scrolling the ayah table on long surahs */
+div[data-testid="stHtml"] { position: sticky; top: 0.5rem; z-index: 50; }
+div[data-testid="stHtml"] #capwrap { box-shadow: 0 8px 32px rgba(0,0,0,0.55); }
 /* Fullscreen button needs a 44px touch target on mobile */
 #fsbtn { min-height: 44px; min-width: 44px; }
 /* Data editor: allow horizontal scroll on narrow screens */
@@ -197,6 +200,11 @@ div[data-testid="stDataFrame"] { overflow-x: auto; }
   div[data-testid="stHorizontalBlock"] > div[data-testid="column"] { min-width: 100%; flex-basis: 100%; }
   .stButton > button { width: 100%; min-height: 48px; font-size: 1rem; }
   #cap { left: 2%; right: 2%; }
+  /* Sticky player sits closer to the viewport top on phones */
+  div[data-testid="stHtml"] { top: 0.25rem; }
+  #capwrap { border-radius: 10px; }
+  /* Sliders / controls get full-width touch-friendly rows */
+  div[data-testid="stSlider"] { padding: 0.4rem 0; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -259,6 +267,13 @@ ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
+ss.setdefault("asr_backend", "groq")
+
+BACKENDS = {
+    "groq": "Groq (free)",
+    "gemini": "Gemini (free)",
+    "elevenlabs": "ElevenLabs Scribe (precise, needs key)",
+}
 
 
 def api_error(resp: requests.Response):
@@ -344,10 +359,20 @@ def player_html(media_url: str, segments: list[dict], lang: str, styles: dict, p
 if (!window.__qcap) {{
   window.__qcap = {{}};
 
+  // Cache keyed on the attribute value: Streamlit reruns swap data-segs /
+  // data-st on the SAME DOM node when segments are re-aligned or styles
+  // edited, so a parse-once cache would keep showing stale timings. Re-parse
+  // whenever the attribute changes.
   function parseWrap(w) {{
     try {{
-      if (!w.__segs) w.__segs = JSON.parse(atob(w.dataset.segs || ''));
-      if (!w.__st) w.__st = JSON.parse(atob(w.dataset.st || ''));
+      if (w.__segsKey !== w.dataset.segs) {{
+        w.__segs = JSON.parse(atob(w.dataset.segs || ''));
+        w.__segsKey = w.dataset.segs;
+      }}
+      if (w.__stKey !== w.dataset.st) {{
+        w.__st = JSON.parse(atob(w.dataset.st || ''));
+        w.__stKey = w.dataset.st;
+      }}
     }} catch (e) {{ w.__segs = w.__segs || []; w.__st = w.__st || {{}}; }}
     return w;
   }}
@@ -637,6 +662,15 @@ if uploaded is not None:
 if ss["file_bytes"] is not None and ss["align_result"] is None:
     st.video(ss["file_bytes"])
 
+    ss["asr_backend"] = st.selectbox(
+        "Transcription engine",
+        options=list(BACKENDS.keys()),
+        format_func=lambda x: BACKENDS[x],
+        index=list(BACKENDS.keys()).index(ss["asr_backend"])
+        if ss["asr_backend"] in BACKENDS else 0,
+        help="Groq is free and unlimited-ish. Scribe has ~50ms word timing "
+             "but needs ELEVENLABS_API_KEY on the server (4.5h/month free).",
+    )
     generate = st.button("Generate Captions", type="primary", use_container_width=True)
     if generate:
         if not ss.get("media_id"):
@@ -658,7 +692,8 @@ if ss["file_bytes"] is not None and ss["align_result"] is None:
                     ss["media_uploaded"] = True
                 resp = requests.post(
                     f"{API_URL}/align",
-                    data={"job": "1", "media_id": ss["media_id"]},
+                    data={"job": "1", "media_id": ss["media_id"],
+                          "asr_backend": ss.get("asr_backend") or "groq"},
                     timeout=120,
                 )
             except requests.RequestException as e:
@@ -838,6 +873,7 @@ if ss["align_result"] is not None and ss["segments"]:
                     st.error(f"Could not download the rendered video: {e}")
                 ss["render_job_id"] = None
             else:
+                time.sleep(1.5)
                 st.rerun()
 
     def on_segment_edit():
@@ -853,16 +889,36 @@ if ss["align_result"] is not None and ss["segments"]:
                     seg[k] = max(0.0, float(v))
                 else:
                     seg[k] = str(v)
-        st.rerun()
+        # keep chronological + non-overlapping after manual edits
+        segs.sort(key=lambda s: s["start"])
+        for a, b in zip(segs, segs[1:]):
+            if b["start"] < a["end"]:
+                b["start"] = a["end"]
+        # no st.rerun() here: Streamlit reruns automatically after on_change
+        # (an explicit rerun causes a double-rerun that can drop edits).
 
     st.markdown("#### Ayah timing & text — edit to fix any misalignment")
-    df = pd.DataFrame(ss["segments"])[["ayah", "start", "end", "text_ar", "text_en"]]
+    ayahs = sorted({s["ayah"] for s in ss["segments"]})
+    jump = st.selectbox(
+        "Jump to ayah",
+        options=["All"] + [str(a) for a in ayahs],
+        help="Filter the table to one ayah. Switch back to All to edit.",
+    )
+    full_df = pd.DataFrame(ss["segments"])[["ayah", "start", "end", "text_ar", "text_en"]]
+    if jump == "All":
+        df, editable, note = full_df, True, None
+    else:
+        df = full_df[full_df["ayah"] == int(jump)]
+        editable, note = False, "Viewing one ayah — switch to All to edit."
+    if note:
+        st.caption(note)
     st.data_editor(
         df,
         key="seg_editor",
         num_rows="fixed",
         hide_index=True,
-        on_change=on_segment_edit,
+        disabled=not editable,
+        on_change=on_segment_edit if editable else None,
         column_config={
             "ayah": st.column_config.NumberColumn("Ayah", min_value=1, step=1),
             "start": st.column_config.NumberColumn("Start (s)", min_value=0.0, format="%.2f"),

@@ -46,7 +46,7 @@ def test_plan_chunks_tiles_whole_2h_clip():
     assert max(e - s for s, e in bounds) <= MAX_REQUEST_SECONDS + 2 * OVERLAP_SECONDS + 1e-6
     assert bounds[0][0] == pytest.approx(0.0)
     assert bounds[-1][1] == pytest.approx(dur)
-    # 13 nominal 600s pieces -> 13 expanded bounds
+    # ceil(dur / MAX_REQUEST_SECONDS) nominal pieces -> same count expanded
     assert len(bounds) == math.ceil(dur / MAX_REQUEST_SECONDS)
 
 
@@ -120,5 +120,5 @@ def test_full_transcribe_with_slices(tmp_path):
     assert res["transcript"]
     assert all(0.0 <= w["start"] <= dur for w in res["words"])
     assert "كلم" in res["transcript"]
-    # each bound produced exactly one API call (no shrink needed)
-    assert len(p._client.calls) == 2
+    # 2-min chunking: (0,600) -> 5 calls, (600,900) -> 3 calls
+    assert len(p._client.calls) == 8

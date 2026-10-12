@@ -22,6 +22,12 @@ from backend.aligner import ASREngine
 from backend.detector import SurahDetector
 from backend.renderer import render_captions, render_preview, DEFAULT_STYLES
 from backend.config import TEMP_DIR, CONFIDENCE_THRESHOLD, FFMPEG_PATH
+
+# Caption-level match gate (lower than CONFIDENCE_THRESHOLD): disjoint rough
+# matches (e.g. a slightly misheard Fatihah opening at 0.84) are real and
+# must caption; overlapping spurious lanes are already resolved by coverage
+# vote in the detector. Minutes-long wrong captions scored ~0.57.
+MATCH_GATE = 0.80
 from backend.segmenter import build_srt, segments_from_word_times, segments_from_provider_times, snap_words_to_silence
 from backend.forced_aligner import ForcedAligner
 from backend.providers import get_asr_provider
@@ -53,9 +59,20 @@ app = FastAPI(
 )
 
 
+def _media_path_or_404(media_id: str) -> str:
+    """Resolve a stored /media upload or 404 (engine restarted / unknown id).
+    Lets /align and /render reuse the server-side copy so the client uploads
+    the file ONCE instead of once per endpoint."""
+    path = MEDIA_FILES.get(media_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Media not found — re-upload the file")
+    return path
+
+
 @app.post("/align", response_model=AlignResponse | ErrorResponse | dict)
 def align_audio(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    media_id: str = Form(None),
     duration: float = Form(None),
     fps: float = Form(None),
     width: int = Form(None),
@@ -67,10 +84,21 @@ def align_audio(
     (job=1): returns {"job_id"} immediately, work runs in a background thread,
     progress via GET /align/status/{id}, result via GET /align/result/{id} —
     mirrors /render so the UI can show a progress bar (long clips take
-    minutes)."""
+    minutes).
+
+    Upload once: pass media_id from an earlier POST /media/{id} instead of
+    re-uploading the file — the server reuses its stored copy."""
     if job:
         _purge_old_align_jobs()
-        content = file.file.read()
+        if file is not None and getattr(file, "filename", None):
+            content = file.file.read()
+            filename = file.filename or "audio"
+            media_path = None
+        elif media_id:
+            media_path = _media_path_or_404(media_id)
+            content, filename = None, None
+        else:
+            raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
         jid = uuid.uuid4().hex
         ALIGN_JOBS[jid] = {
             "status": "queued",
@@ -82,12 +110,17 @@ def align_audio(
         }
         threading.Thread(
             target=_align_job_worker,
-            args=(jid, content, file.filename or "audio", duration, fps,
+            args=(jid, content, filename, media_path, duration, fps,
                   width, height, asr_backend),
             daemon=True,
         ).start()
         return {"job_id": jid, "status": "queued"}
-    return _align_impl(file, duration, fps, width, height, asr_backend)
+    if file is not None and getattr(file, "filename", None):
+        return _align_impl(file, duration, fps, width, height, asr_backend)
+    if media_id:
+        return _align_impl(None, duration, fps, width, height, asr_backend,
+                           media_path=_media_path_or_404(media_id))
+    raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
 
 
 def _align_impl(
@@ -98,39 +131,50 @@ def _align_impl(
     height: int | None = None,
     asr_backend: str | None = None,
     p=None,
+    media_path: str | None = None,
 ):
     """Shared align pipeline (sync path + background job worker). p: optional
-    callable(stage: str, percent: float) for UI progress reporting."""
+    callable(stage: str, percent: float) for UI progress reporting.
+    media_path: reuse a stored /media copy (owned=False — never deleted)."""
     audio_path = None
     sliced_path = None
     temp_slices = []
+    owned = media_path is None
 
     def setp(stage: str, pct: float):
         if p:
             p(stage, pct)
 
     try:
-        ext = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
-        audio_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}{ext}")
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        with open(audio_path, "wb") as f:
-            content = file.file.read()
-            f.write(content)
+        if media_path:
+            audio_path = media_path
+            os.makedirs(TEMP_DIR, exist_ok=True)
+        elif file is not None:
+            ext = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+            audio_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}{ext}")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            with open(audio_path, "wb") as f:
+                content = file.file.read()
+                f.write(content)
+        else:
+            return ErrorResponse(error="Upload a file or pass media_id")
 
         if audio_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
             old_path = audio_path
             audio_path, _ = asr_engine.extract_audio(old_path)
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
+            if owned:
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
         elif not audio_path.lower().endswith(".wav"):
             old_path = audio_path
             audio_path, _ = asr_engine.extract_audio(old_path)
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
+            if owned:
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
 
         import soundfile as sf
         from backend.vad import get_speech_segments, merge_segments, chunk_for_whisper, speech_span, silence_runs_from_segments
@@ -155,7 +199,8 @@ def _align_impl(
 
         provider = get_asr_provider(asr_backend)
         if provider is not None:
-            return _align_with_provider(provider, audio_path, segs, setp, sil_runs)
+            return _align_with_provider(provider, audio_path, segs, setp,
+                                        sil_runs, raw_segs)
 
         setp("transcribing (local model)…", 20)
         wchunks = chunk_for_whisper(segs)
@@ -182,6 +227,7 @@ def _align_impl(
                 matches = [tight]
         if not matches:
             return ErrorResponse(error="Could not identify any surah")
+        matches = _gate_matches(matches)
         setp("surah detected, aligning words…", 42)
 
         chunk_texts = result.get("chunk_texts", [])
@@ -318,7 +364,7 @@ def _align_impl(
                     os.remove(p)
                 except OSError:
                     pass
-        if audio_path and os.path.exists(audio_path):
+        if owned and audio_path and os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
             except OSError:
@@ -351,6 +397,7 @@ def _align_job_worker(
     jid: str,
     content: bytes,
     filename: str,
+    media_path: str | None,
     duration: float | None,
     fps: float | None,
     width: int | None,
@@ -365,10 +412,16 @@ def _align_job_worker(
         job["progress"] = round(float(pct), 1)
 
     try:
-        result = _align_impl(
-            _JobUpload(filename, content), duration, fps, width, height,
-            asr_backend, p=p,
-        )
+        if media_path:
+            result = _align_impl(
+                None, duration, fps, width, height,
+                asr_backend, p=p, media_path=media_path,
+            )
+        else:
+            result = _align_impl(
+                _JobUpload(filename, content), duration, fps, width, height,
+                asr_backend, p=p,
+            )
         dumps = result.model_dump()
         job["result"] = dumps
         job["status"] = "error" if "error" in dumps else "done"
@@ -400,7 +453,12 @@ async def align_result(job_id: str):
     if job["status"] not in ("done", "error"):
         raise HTTPException(status_code=409, detail="Align not finished yet")
     if job["status"] == "error":
-        return {"error": job.get("error") or "Align failed"}
+        # ErrorResponse results land here with status "error" but their
+        # message in job["result"] (job["error"] is only set on crashes) —
+        # prefer it so clients see e.g. "groq transcription failed: ..."
+        # instead of a generic "Align failed".
+        result = job.get("result") or {}
+        return {"error": job.get("error") or result.get("error") or "Align failed"}
     return job["result"]
 
 
@@ -415,6 +473,21 @@ def _dump_stage1(transcript: str, words: list[dict]):
             }, f, ensure_ascii=False)
     except Exception:
         pass
+
+
+def _gate_matches(matches):
+    """Drop low-confidence matches when a good one exists. On repetition-heavy
+    clips the detector DP wanders through wrong-ayah lanes (short repeated
+    phrases resemble many canon spots, scoring 0.55-0.8) and those would
+    caption WRONG text for minutes. Cross-surah duplicates are already
+    resolved by coverage vote in the detector; this gate only removes the
+    leftover low-score lanes. When nothing reaches the gate, keep everything
+    (legacy recall fallback)."""
+    if not matches:
+        return matches
+    if max(m.score for m in matches) < MATCH_GATE:
+        return matches
+    return [m for m in matches if m.score >= MATCH_GATE]
 
 
 def _build_align_response(match_infos, words, segments, end_time: float | None = None) -> AlignResponse | None:
@@ -459,24 +532,53 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
     return response
 
 
-def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None) -> AlignResponse | ErrorResponse:
+def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None, raw_segs=None) -> AlignResponse | ErrorResponse:
     """Hosted-ASR path (groq/gemini): word timestamps come from the provider,
     so detection + ayah segmentation happen without forced alignment.
-    sil_runs: audio-truth silence regions for phrase splitting."""
+    sil_runs: audio-truth silence regions for phrase splitting. raw_segs:
+    raw (unmerged) VAD speech segments — per-segment drift anchoring,
+    silence-aware request packing, and VAD-clamped phrase bounds."""
     def setp(stage: str, pct: float):
         if p:
             p(stage, pct)
 
+    # Per-slice progress + retry visibility for EVERY provider: a frozen bar
+    # is indistinguishable from a hang (an 8-min Gemini clip used to sit at
+    # 15% through one giant request plus minutes of silent backoff). last_pct
+    # lets retry notices reuse the current bar position instead of resetting.
+    last_pct = {"v": 18.0}
+
+    def _prog(frac, label):
+        last_pct["v"] = 18 + min(62, round(62 * float(frac) / 100))
+        setp(label, last_pct["v"])
+
+    def _retry(msg):
+        setp(msg, last_pct["v"])
+
     try:
+        label = f"transcribing via {provider.name.title()}…"
         if provider.name == "groq":
             result = provider.transcribe(
                 audio_path, slices=segs,
-                progress_cb=lambda frac: setp(
-                    "transcribing via Groq…", 18 + min(62, round(62 * frac / 100))
-                ),
+                anchor_slices=raw_segs or segs,
+                speech_segs=raw_segs,
+                progress_cb=lambda frac: _prog(frac, label),
+            )
+        elif provider.name == "gemini":
+            result = provider.transcribe(
+                audio_path, slices=segs,
+                anchor_slices=raw_segs or segs,
+                speech_segs=raw_segs,
+                progress_cb=lambda frac: _prog(frac, label),
+                on_retry=_retry,
             )
         else:
-            result = provider.transcribe(audio_path, slices=segs)
+            result = provider.transcribe(
+                audio_path, slices=segs,
+                anchor_slices=raw_segs or segs,
+                speech_segs=raw_segs,
+                progress_cb=lambda frac: _prog(frac, label),
+            )
         setp("transcription complete", 80)
     except Exception as e:
         return ErrorResponse(error=str(e))
@@ -500,7 +602,8 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None)
         return ErrorResponse(error="Could not identify any surah")
 
     setp("building captions…", 94)
-    segments = segments_from_provider_times(matches, words, sil_runs)
+    matches = _gate_matches(matches)
+    segments = segments_from_provider_times(matches, words, sil_runs, raw_segs)
     match_infos = []
     for m in sorted(matches, key=lambda m: (m.chain[0][0] if m.chain else 0)):
         match_infos.append(MatchInfo(
@@ -551,11 +654,16 @@ def media_preview(media_id: str):
         raise HTTPException(status_code=404, detail="Media not found")
     out = os.path.join(TEMP_DIR, f"preview_{media_id}.mp4")
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(path):
+        # -avoid_negative_ts make_zero normalizes the ~40ms container A/V
+        # start offset user MP4s carry (video start 0.04 vs audio 0.0): both
+        # streams start at zero in the preview, so the audio-derived caption
+        # timestamps line up with what the browser plays frame-for-frame.
         cmd = [
             FFMPEG_PATH, "-y", "-i", path,
             "-vf", "scale=320:-2", "-r", "24",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
             "-c:a", "aac", "-b:a", "32k", "-ac", "1",
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart", out,
         ]
         try:
@@ -602,6 +710,7 @@ def _render_job_worker(
     styles: dict,
     width: int | None,
     height: int | None,
+    cleanup_input: bool = True,
 ):
     job = RENDER_JOBS[job_id]
     try:
@@ -628,11 +737,12 @@ def _render_job_worker(
         job["status"] = "error"
         job["error"] = str(e)
     finally:
-        try:
-            if os.path.exists(video_path):
-                os.remove(video_path)
-        except OSError:
-            pass
+        if cleanup_input:
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except OSError:
+                pass
 
 
 def _purge_old_jobs():
@@ -651,7 +761,8 @@ def _purge_old_jobs():
 
 @app.post("/render")
 async def render_video(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    media_id: str = Form(None),
     srt: str = Form(...),
     width: int = Form(None),
     height: int = Form(None),
@@ -667,12 +778,19 @@ async def render_video(
 ):
     _purge_old_jobs()
     video_path = None
+    cleanup_input = True
     try:
-        ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-        video_path = os.path.join(TEMP_DIR, f"input_{uuid.uuid4()}{ext}")
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        with open(video_path, "wb") as f:
-            f.write(await file.read())
+        if file is not None and getattr(file, "filename", None):
+            ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+            video_path = os.path.join(TEMP_DIR, f"input_{uuid.uuid4()}{ext}")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            with open(video_path, "wb") as f:
+                f.write(await file.read())
+        elif media_id:
+            video_path = _media_path_or_404(media_id)
+            cleanup_input = False
+        else:
+            raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
 
         styles = _parse_style_form(
             font_size=font_size,
@@ -698,14 +816,16 @@ async def render_video(
 
         thread = threading.Thread(
             target=_render_job_worker,
-            args=(job_id, video_path, srt, styles, width, height),
+            args=(job_id, video_path, srt, styles, width, height, cleanup_input),
             daemon=True,
         )
         thread.start()
 
         return {"job_id": job_id, "status": "queued"}
+    except HTTPException:
+        raise
     except Exception as e:
-        if video_path and os.path.exists(video_path):
+        if cleanup_input and video_path and os.path.exists(video_path):
             try:
                 os.remove(video_path)
             except OSError:

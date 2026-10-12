@@ -22,6 +22,12 @@ from backend.aligner import ASREngine
 from backend.detector import SurahDetector
 from backend.renderer import render_captions, render_preview, DEFAULT_STYLES
 from backend.config import TEMP_DIR, CONFIDENCE_THRESHOLD, FFMPEG_PATH
+
+# Caption-level match gate (lower than CONFIDENCE_THRESHOLD): disjoint rough
+# matches (e.g. a slightly misheard Fatihah opening at 0.84) are real and
+# must caption; overlapping spurious lanes are already resolved by coverage
+# vote in the detector. Minutes-long wrong captions scored ~0.57.
+MATCH_GATE = 0.80
 from backend.segmenter import build_srt, segments_from_word_times, segments_from_provider_times, snap_words_to_silence
 from backend.forced_aligner import ForcedAligner
 from backend.providers import get_asr_provider
@@ -193,7 +199,8 @@ def _align_impl(
 
         provider = get_asr_provider(asr_backend)
         if provider is not None:
-            return _align_with_provider(provider, audio_path, segs, setp, sil_runs)
+            return _align_with_provider(provider, audio_path, segs, setp,
+                                        sil_runs, raw_segs)
 
         setp("transcribing (local model)…", 20)
         wchunks = chunk_for_whisper(segs)
@@ -220,6 +227,7 @@ def _align_impl(
                 matches = [tight]
         if not matches:
             return ErrorResponse(error="Could not identify any surah")
+        matches = _gate_matches(matches)
         setp("surah detected, aligning words…", 42)
 
         chunk_texts = result.get("chunk_texts", [])
@@ -445,7 +453,12 @@ async def align_result(job_id: str):
     if job["status"] not in ("done", "error"):
         raise HTTPException(status_code=409, detail="Align not finished yet")
     if job["status"] == "error":
-        return {"error": job.get("error") or "Align failed"}
+        # ErrorResponse results land here with status "error" but their
+        # message in job["result"] (job["error"] is only set on crashes) —
+        # prefer it so clients see e.g. "groq transcription failed: ..."
+        # instead of a generic "Align failed".
+        result = job.get("result") or {}
+        return {"error": job.get("error") or result.get("error") or "Align failed"}
     return job["result"]
 
 
@@ -460,6 +473,21 @@ def _dump_stage1(transcript: str, words: list[dict]):
             }, f, ensure_ascii=False)
     except Exception:
         pass
+
+
+def _gate_matches(matches):
+    """Drop low-confidence matches when a good one exists. On repetition-heavy
+    clips the detector DP wanders through wrong-ayah lanes (short repeated
+    phrases resemble many canon spots, scoring 0.55-0.8) and those would
+    caption WRONG text for minutes. Cross-surah duplicates are already
+    resolved by coverage vote in the detector; this gate only removes the
+    leftover low-score lanes. When nothing reaches the gate, keep everything
+    (legacy recall fallback)."""
+    if not matches:
+        return matches
+    if max(m.score for m in matches) < MATCH_GATE:
+        return matches
+    return [m for m in matches if m.score >= MATCH_GATE]
 
 
 def _build_align_response(match_infos, words, segments, end_time: float | None = None) -> AlignResponse | None:
@@ -504,24 +532,53 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
     return response
 
 
-def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None) -> AlignResponse | ErrorResponse:
+def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None, raw_segs=None) -> AlignResponse | ErrorResponse:
     """Hosted-ASR path (groq/gemini): word timestamps come from the provider,
     so detection + ayah segmentation happen without forced alignment.
-    sil_runs: audio-truth silence regions for phrase splitting."""
+    sil_runs: audio-truth silence regions for phrase splitting. raw_segs:
+    raw (unmerged) VAD speech segments — per-segment drift anchoring,
+    silence-aware request packing, and VAD-clamped phrase bounds."""
     def setp(stage: str, pct: float):
         if p:
             p(stage, pct)
 
+    # Per-slice progress + retry visibility for EVERY provider: a frozen bar
+    # is indistinguishable from a hang (an 8-min Gemini clip used to sit at
+    # 15% through one giant request plus minutes of silent backoff). last_pct
+    # lets retry notices reuse the current bar position instead of resetting.
+    last_pct = {"v": 18.0}
+
+    def _prog(frac, label):
+        last_pct["v"] = 18 + min(62, round(62 * float(frac) / 100))
+        setp(label, last_pct["v"])
+
+    def _retry(msg):
+        setp(msg, last_pct["v"])
+
     try:
+        label = f"transcribing via {provider.name.title()}…"
         if provider.name == "groq":
             result = provider.transcribe(
                 audio_path, slices=segs,
-                progress_cb=lambda frac: setp(
-                    "transcribing via Groq…", 18 + min(62, round(62 * frac / 100))
-                ),
+                anchor_slices=raw_segs or segs,
+                speech_segs=raw_segs,
+                progress_cb=lambda frac: _prog(frac, label),
+            )
+        elif provider.name == "gemini":
+            result = provider.transcribe(
+                audio_path, slices=segs,
+                anchor_slices=raw_segs or segs,
+                speech_segs=raw_segs,
+                progress_cb=lambda frac: _prog(frac, label),
+                on_retry=_retry,
             )
         else:
-            result = provider.transcribe(audio_path, slices=segs)
+            result = provider.transcribe(
+                audio_path, slices=segs,
+                anchor_slices=raw_segs or segs,
+                speech_segs=raw_segs,
+                progress_cb=lambda frac: _prog(frac, label),
+            )
         setp("transcription complete", 80)
     except Exception as e:
         return ErrorResponse(error=str(e))
@@ -545,7 +602,8 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None)
         return ErrorResponse(error="Could not identify any surah")
 
     setp("building captions…", 94)
-    segments = segments_from_provider_times(matches, words, sil_runs)
+    matches = _gate_matches(matches)
+    segments = segments_from_provider_times(matches, words, sil_runs, raw_segs)
     match_infos = []
     for m in sorted(matches, key=lambda m: (m.chain[0][0] if m.chain else 0)):
         match_infos.append(MatchInfo(
@@ -596,11 +654,16 @@ def media_preview(media_id: str):
         raise HTTPException(status_code=404, detail="Media not found")
     out = os.path.join(TEMP_DIR, f"preview_{media_id}.mp4")
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(path):
+        # -avoid_negative_ts make_zero normalizes the ~40ms container A/V
+        # start offset user MP4s carry (video start 0.04 vs audio 0.0): both
+        # streams start at zero in the preview, so the audio-derived caption
+        # timestamps line up with what the browser plays frame-for-frame.
         cmd = [
             FFMPEG_PATH, "-y", "-i", path,
             "-vf", "scale=320:-2", "-r", "24",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
             "-c:a", "aac", "-b:a", "32k", "-ac", "1",
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart", out,
         ]
         try:

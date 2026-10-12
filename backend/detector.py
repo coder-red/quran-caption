@@ -161,6 +161,12 @@ class SurahDetector:
             self._collect_long(twords, matches, min_score, depth=0)
         else:
             self._collect(twords, matches, min_score, depth=0)
+        # Repeat expansion: learning clips recite one span a dozen times and
+        # the monotone alignment can only follow a single pass per lane.
+        # Re-scan for extra fuzzy occurrences of each confident span.
+        ftwords = [t for t in twords if t[1] in self._word_pos]
+        matches.extend(self._expand_repeats(ftwords, matches))
+        matches = self._resolve_conflicts(matches)
         return matches
 
     def _collect(
@@ -170,7 +176,11 @@ class SurahDetector:
         min_score: float,
         depth: int,
     ):
-        if depth > 4:
+        # Depth cap is generous (10 lanes): repetition-heavy recitations
+        # (learning clips repeating one ayah a dozen times) recover one lane
+        # per level. Termination is guaranteed — a level with no accepted run
+        # returns without recursing, and every recursing level consumes words.
+        if depth > 10:
             return
         from bisect import bisect_right, bisect_left
         flat = self._flat
@@ -337,6 +347,167 @@ class SurahDetector:
             consumed.update(ti for ti, _ in run)
         return consumed
 
+    def _expand_repeats(
+        self,
+        twords: list[tuple[int, str]],
+        matches: list[AyahMatch],
+        min_score: float = 0.85,
+    ) -> list[AyahMatch]:
+        """Find extra recited occurrences of each confident match's canon span.
+
+        The monotone transcript-vs-canon alignment follows one repeat pass per
+        lane, so memorization clips (one ayah ×12) map a single occurrence and
+        leave the rest blank. Here the span text is KNOWN (fixed recitation),
+        so every additional fuzzy occurrence becomes its own AyahMatch with a
+        global-word_idx chain — each repeat gets captioned at its own time.
+
+        Conservative by design: only spans from matches scoring >= min_score
+        are expanded; an occurrence needs >=70% of the span words (and >=
+        min(6, span)) with tight skip budgets; occurrences overlapping already
+        consumed words by >=30% are rejected (the original occurrence itself
+        re-matches ~100% consumed and is skipped, never duplicated)."""
+        flat = self._flat
+        if not matches or not twords:
+            return []
+        from data.quran_text import load_ayah_texts
+        texts = load_ayah_texts()
+        canon_cache: dict[tuple[int, int], list[str]] = {}
+
+        def canon_words(surah: int, ayah: int) -> list[str]:
+            key = (surah, ayah)
+            if key not in canon_cache:
+                canon_cache[key] = _normalize(
+                    texts.get(f"{surah}:{ayah}", "")).split()
+            return canon_cache[key]
+
+        consumed: set[int] = set()
+        for m in matches:
+            for wi, _, _ in (m.chain or []):
+                consumed.add(wi)
+
+        added: list[AyahMatch] = []
+        for m in matches:
+            if m.score < min_score or not m.word_off:
+                continue
+            # The match's own contiguous canon span (may start/end mid-ayah).
+            # Entries carry ABSOLUTE canon offsets so word_off stays correct
+            # when the span itself is mid-ayah trimmed.
+            span: list[tuple[int, int, str]] = []
+            for ayah in range(m.start_ayah, m.end_ayah + 1):
+                off = (m.word_off or {}).get(ayah)
+                cw = canon_words(m.surah, ayah)
+                if off:
+                    first, last = max(0, off[0]), min(len(cw), off[1])
+                else:
+                    first, last = 0, len(cw)
+                span.extend((ayah, ci, w)
+                            for ci, w in enumerate(cw[first:last], start=first))
+            L = len(span)
+            if L < 3 or len(twords) < L:
+                continue
+            need = max(min(6, L), int(L * 0.7 + 0.999))
+            # Greedy occurrence scan over transcript positions.
+            k = 0
+            found_here = 0
+            while k < len(twords) and found_here < 24:
+                if twords[k][1] != span[0][2]:
+                    k += 1
+                    continue
+                # Extend: transcript skips (misheard/extra) and canon skips
+                # (skipped words) on tight consecutive budgets.
+                ti, ci = k, 0
+                matched: list[tuple[int, int]] = []  # (tpos, cpos)
+                tskip = cskip = 0
+                while ti < len(twords) and ci < L:
+                    if twords[ti][1] == span[ci][2]:
+                        matched.append((ti, ci))
+                        ti += 1
+                        ci += 1
+                        tskip = cskip = 0
+                    elif tskip < 3:
+                        ti += 1
+                        tskip += 1
+                        cskip = 0
+                    elif cskip < 2:
+                        ci += 1
+                        cskip += 1
+                        tskip = 0
+                    else:
+                        break
+                if len(matched) >= need:
+                    occ = {twords[t][0] for t, _ in matched}
+                    if len(occ & consumed) <= 0.3 * len(occ):
+                        chain = sorted(
+                            (twords[t][0], m.surah, span[c][0])
+                            for t, c in matched)
+                        word_off: dict[int, tuple[int, int]] = {}
+                        for _, c in matched:
+                            ayah, coff = span[c][0], span[c][1]
+                            if ayah in word_off:
+                                lo, hi = word_off[ayah]
+                                word_off[ayah] = (min(lo, coff), max(hi, coff + 1))
+                            else:
+                                word_off[ayah] = (coff, coff + 1)
+                        score = round(len(matched) / L, 4)
+                        added.append(AyahMatch(
+                            surah=m.surah,
+                            start_ayah=chain[0][1],
+                            end_ayah=chain[-1][1],
+                            score=score,
+                            text=" ".join(w for _, _, w in span),
+                            word_span=(chain[0][0], chain[-1][0]),
+                            chain=chain,
+                            word_off=word_off,
+                        ))
+                        consumed.update(occ)
+                        found_here += 1
+                        k = ti
+                        continue
+                k += 1
+        return added
+
+    def _resolve_conflicts(
+        self, matches: list[AyahMatch]
+    ) -> list[AyahMatch]:
+        """Drop cross-surah duplicate claims over the same transcript words.
+
+        Identical verses exist in multiple surahs (2:5 == 31:5; 2:4 ~= 31:4),
+        so rival lanes can claim the SAME recited words with score 1.0 each.
+        Context disambiguates: the surah owning more total chained words
+        (the recitation's actual surah) wins; the loser is dropped when >=50%
+        of the smaller claim overlaps. Same-surah overlaps are never dropped
+        (legitimate repeats). Full ties break toward the lower surah id —
+        the displayed text is identical anyway. Returns a filtered list."""
+        if len(matches) < 2:
+            return matches
+        cov: dict[int, int] = {}
+        for m in matches:
+            cov[m.surah] = cov.get(m.surah, 0) + len(m.chain or [])
+        wordsof: dict[int, set[int]] = {
+            id(m): {wi for wi, _, _ in (m.chain or [])} for m in matches
+        }
+        drop: set[int] = set()
+        for i, a in enumerate(matches):
+            if id(a) in drop:
+                continue
+            for b in matches[i + 1:]:
+                if id(b) in drop or a.surah == b.surah:
+                    continue
+                wa, wb = wordsof[id(a)], wordsof[id(b)]
+                if not wa or not wb:
+                    continue
+                if len(wa & wb) < 0.5 * min(len(wa), len(wb)):
+                    continue
+                ka = (cov[a.surah], a.score, a.surah)
+                kb = (cov[b.surah], b.score, b.surah)
+                # Higher coverage wins; ties: higher score, then lower surah
+                # id (the -id term makes min() drop the higher id on full tie).
+                loser = a if (kb[0], kb[1], -kb[2]) >= (ka[0], ka[1], -ka[2]) else b
+                drop.add(id(loser))
+        if not drop:
+            return matches
+        return [m for m in matches if id(m) not in drop]
+
     def _candidate_surahs(self, twords: list[tuple[int, str]], k: int = 2) -> list[int]:
         """Rank surahs by how many distinctive words of the transcript's
         opening occur in them (IDF-weighted bag-of-words over the first 60
@@ -470,29 +641,45 @@ class SurahDetector:
         """Detection for LONG transcripts (full-surah / multi-minute clips)
         where the beam search of _collect dies from common-word drift.
         Aligns against the top candidate surah with a banded monotone DP,
-        emits runs, then recurses on the unconsumed remainder (next surahs)."""
-        if depth > 4:
+        emits runs, then recurses on the unconsumed remainder (next surahs —
+        or, for repetition-heavy recitations, the NEXT REPEAT of the same
+        surah: the monotone DP can only follow one repeat pass per lane, so a
+        large same-surah remainder means unmapped repeats, not noise)."""
+        if depth > 10:
             return
         twords = [t for t in twords if t[1] in self._word_pos]
         if len(twords) < 300:
             self._collect(twords, matches, min_score, depth)
             return
         best_chain: list[tuple[int, int]] | None = None
-        for surah in self._candidate_surahs(twords):
+        chains: list[tuple[int, list[tuple[int, int]]]] = []
+        for surah in self._candidate_surahs(twords, k=4):
             chain = self._align_dp(twords, surah)
-            if len(chain) > (len(best_chain) if best_chain else 0):
-                best_chain = chain
-        if best_chain is None or len(best_chain) < 10:
+            if len(chain) >= 10:
+                chains.append((surah, chain))
+        if not chains:
             return
+        # Longest lane first so strong lanes claim their words before
+        # wandering common-word lanes of rival surahs are emitted.
+        chains.sort(key=lambda sc: len(sc[1]), reverse=True)
         if self._debug_chain:
-            s_p, e_p = best_chain[0][1], best_chain[-1][1]
-            print(f"  [depth {depth}] DP chain len={len(best_chain)} "
-                  f"{self._flat[s_p][:2]}..{self._flat[e_p][:2]}")
-        consumed = self._emit_runs(best_chain, twords, matches, min_score)
+            for surah, chain in chains:
+                s_p, e_p = chain[0][1], chain[-1][1]
+                print(f"  [depth {depth}] surah {surah} DP chain "
+                      f"len={len(chain)} {self._flat[s_p][:2]}..{self._flat[e_p][:2]}")
+        consumed: set[int] = set()
+        for surah, chain in chains:
+            consumed.update(
+                self._emit_runs(chain, twords, matches, min_score))
         if not consumed:
             return
         remainder = [t for i, t in enumerate(twords) if i not in consumed]
-        if remainder:
+        if len(remainder) >= 150:
+            # Same-surah remainder this large = unmapped repeats (each repeat
+            # is dozens of words) — recover the next lane regardless of surah
+            # novelty. Smaller remainders take the guarded path below.
+            self._collect_long(remainder, matches, min_score, depth + 1)
+        elif remainder:
             matched_surahs = {m.surah for m in matches}
             next_cands = self._candidate_surahs(remainder)
             if next_cands and not (set(next_cands) & matched_surahs):

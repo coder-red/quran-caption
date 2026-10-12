@@ -18,6 +18,15 @@ def get_asr_provider(name: Optional[str] = None):
                 "(or use ASR_BACKEND=groq / local)"
             ) from exc
         return GeminiProvider()
+    if name == "elevenlabs":
+        try:
+            from backend.providers.elevenlabs import ElevenLabsProvider
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "elevenlabs backend is not installed - pip install elevenlabs "
+                "(or use ASR_BACKEND=groq / local)"
+            ) from exc
+        return ElevenLabsProvider()
     return None  # "local" -> in-process whisper + forced alignment
 
 

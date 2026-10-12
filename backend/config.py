@@ -43,6 +43,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip() or None
 GROQ_MODEL = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or None
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip() or None
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "scribe_v2")
 
 
 def _find_ffmpeg() -> str:
