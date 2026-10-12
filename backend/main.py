@@ -180,6 +180,24 @@ def _align_impl(
         from backend.vad import get_speech_segments, merge_segments, chunk_for_whisper, speech_span, silence_runs_from_segments
         from bisect import bisect_right
 
+        # Low-RAM hosts (Render free tier, 512MB) die decoding hour-long
+        # audio into float32. Refuse BEFORE the full read (header-only
+        # probe) with a clear message instead of an OOM kill. Off by
+        # default (local dev keeps unlimited); set QCAP_MAX_MINUTES on host.
+        try:
+            _max_min = float(os.environ.get("QCAP_MAX_MINUTES", "0") or 0)
+        except ValueError:
+            _max_min = 0.0
+        if _max_min > 0:
+            try:
+                _dur_probe = sf.info(audio_path).duration
+            except Exception:
+                _dur_probe = 0.0
+            if _dur_probe > _max_min * 60:
+                return ErrorResponse(
+                    error=f"Audio too long ({_dur_probe / 60:.0f} min — this host "
+                          f"allows {_max_min:.0f} min; trim the clip and retry)")
+
         audio_full, sr_full = sf.read(audio_path, dtype="float32")
         if len(audio_full.shape) > 1:
             audio_full = audio_full.mean(axis=1)
