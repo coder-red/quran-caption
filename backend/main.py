@@ -392,6 +392,15 @@ def _align_impl(
 ALIGN_JOBS: dict[str, dict] = {}
 ALIGN_JOBS_LOCK = threading.Lock()
 
+# Only one align pipeline may run at a time. Every job is a daemon thread
+# with no other coordination, and the pipeline keeps process-wide state:
+# the shared Silero VAD model (vad._VAD_MODEL), plus the whisper /
+# wav2vec2 models on the local path — all of which are "one resident at a
+# time" by design. Two concurrent /align calls raced on that state and
+# hard-crashed the process (STATUS_HEAP_CORRUPTION 0xC0000374). Jobs still
+# queue and report progress; they just don't interleave.
+ALIGN_PIPELINE_LOCK = threading.Lock()
+
 
 def _purge_old_align_jobs():
     now = time.time()
@@ -430,16 +439,24 @@ def _align_job_worker(
         job["progress"] = round(float(pct), 1)
 
     try:
-        if media_path:
-            result = _align_impl(
-                None, duration, fps, width, height,
-                asr_backend, p=p, media_path=media_path,
-            )
-        else:
-            result = _align_impl(
-                _JobUpload(filename, content), duration, fps, width, height,
-                asr_backend, p=p,
-            )
+        # Wait our turn before touching any shared model state. Tell the
+        # client it is queued rather than silently parked at 0%.
+        if not ALIGN_PIPELINE_LOCK.acquire(blocking=False):
+            p("waiting for the previous job…", 1.0)
+            ALIGN_PIPELINE_LOCK.acquire()
+        try:
+            if media_path:
+                result = _align_impl(
+                    None, duration, fps, width, height,
+                    asr_backend, p=p, media_path=media_path,
+                )
+            else:
+                result = _align_impl(
+                    _JobUpload(filename, content), duration, fps, width, height,
+                    asr_backend, p=p,
+                )
+        finally:
+            ALIGN_PIPELINE_LOCK.release()
         dumps = result.model_dump()
         job["result"] = dumps
         job["status"] = "error" if "error" in dumps else "done"

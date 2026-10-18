@@ -54,4 +54,59 @@ from backend.vad import _energy_segments
 fallback = _energy_segments(audio, sr)
 assert fallback and fallback[0][0] < 8.0, f"energy fallback failed: {fallback}"
 
+# 9. Concurrent get_speech_segments must not corrupt the heap.
+# The torch-Silero branch drives one shared, lazily-loaded module-level
+# model. /align runs each job in its own daemon thread with no other
+# coordination, so two uploads used to hit that model simultaneously and
+# kill the process with STATUS_HEAP_CORRUPTION (0xC0000374) — no Python
+# traceback, just a dead engine. vad.py now holds _VAD_LOCK across the
+# lazy load *and* the inference. This runs the check in a SUBPROCESS on
+# purpose: the failure mode is a hard process abort, which would kill the
+# test runner itself instead of failing an assertion.
+import subprocess
+
+_CONCURRENT = r"""
+import threading, sys
+import numpy as np, soundfile as sf
+from backend.vad import get_speech_segments
+
+audio, sr = sf.read("data/test_ikhlas_16k.wav", dtype="float32")
+if audio.ndim > 1:
+    audio = audio.mean(axis=1)
+N, R = 4, 4
+barrier = threading.Barrier(N)
+out = {}
+
+def worker(i):
+    barrier.wait()
+    try:
+        for _ in range(R):
+            out[i] = get_speech_segments(audio.copy(), sr)
+    except BaseException as e:          # noqa: BLE001
+        out[i] = ("EXC", repr(e))
+
+ts = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(N)]
+[t.start() for t in ts]
+[t.join(timeout=180) for t in ts]
+alive = [t for t in ts if t.is_alive()]
+if alive:
+    print("DEADLOCK"); sys.exit(3)
+vals = [v for v in out.values()]
+if len(out) != N:
+    print("INCOMPLETE", sorted(out)); sys.exit(4)
+if any(isinstance(v, tuple) for v in vals):
+    print("EXCEPTION", vals); sys.exit(5)
+# concurrency must not change the answer
+if any(v != vals[0] for v in vals):
+    print("DIVERGED"); sys.exit(6)
+print("OK", len(vals[0]))
+"""
+_p = subprocess.run([sys.executable, "-c", _CONCURRENT], capture_output=True,
+                    text=True, timeout=600)
+_rc = _p.returncode
+assert _rc == 0, (
+    f"concurrent VAD broke the process (rc={_rc}, "
+    f"0xC0000374={-1073740940}): {(_p.stdout or '').strip()} {(_p.stderr or '').strip()[-400:]}"
+)
+
 print("test_vad.py ALL PASSED")

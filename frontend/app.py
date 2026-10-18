@@ -267,13 +267,6 @@ ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
-ss.setdefault("asr_backend", "groq")
-
-BACKENDS = {
-    "groq": "Groq (free)",
-    "gemini": "Gemini (free)",
-    "elevenlabs": "ElevenLabs Scribe (precise, needs key)",
-}
 
 
 def api_error(resp: requests.Response):
@@ -620,8 +613,28 @@ def ensure_media():
     if DEPLOYED:
         try:
             pv = requests.get(f"{API_URL}/media/{ss['media_id']}/preview", timeout=1200)
+            # Inlining the whole preview as a base64 data URI costs ~33% extra
+            # bytes, holds that copy in session_state for the life of the
+            # session, and re-sends it over the websocket on EVERY rerun
+            # (style/lang/segment edits all rerun). On a 512MB host that
+            # growth is what tips the service into the OOM killer, and it
+            # makes every interaction slow. Only inline while it is cheap.
+            cap_mb = float(os.environ.get("QCAP_PREVIEW_INLINE_MB", "8") or 8)
             if pv.status_code == 200 and pv.content:
-                ss["media_data_uri"] = "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
+                if len(pv.content) <= cap_mb * 1024 * 1024:
+                    ss["media_data_uri"] = (
+                        "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
+                    )
+                else:
+                    ss["media_data_uri"] = None
+                    st.warning(
+                        f"Preview skipped: this clip's preview is "
+                        f"{len(pv.content)/1e6:.0f} MB (over the {cap_mb:.0f} MB "
+                        "inline limit) and inlining it would exhaust this host's "
+                        "memory. Captions below are still correct — set "
+                        "QCAP_PUBLIC_URL to a public API URL to restore the "
+                        "video preview."
+                    )
             elif pv.status_code == 404:
                 # Engine restarted and lost the copy — re-upload next run.
                 ss["media_uploaded"] = False
@@ -695,15 +708,6 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
         # reused, so just offer Generate again (e.g. after a failed run).
         st.info("File is already on the caption engine — press Generate Captions to (re)run.")
 
-    ss["asr_backend"] = st.selectbox(
-        "Transcription engine",
-        options=list(BACKENDS.keys()),
-        format_func=lambda x: BACKENDS[x],
-        index=list(BACKENDS.keys()).index(ss["asr_backend"])
-        if ss["asr_backend"] in BACKENDS else 0,
-        help="Groq is free and unlimited-ish. Scribe has ~50ms word timing "
-             "but needs ELEVENLABS_API_KEY on the server (4.5h/month free).",
-    )
     generate = st.button("Generate Captions", type="primary", use_container_width=True)
     if generate:
         if not ss.get("media_id"):
@@ -730,8 +734,9 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                     drop_media_bytes()
                 resp = requests.post(
                     f"{API_URL}/align",
-                    data={"job": "1", "media_id": ss["media_id"],
-                          "asr_backend": ss.get("asr_backend") or "groq"},
+                    # Engine is chosen server-side (ASR_BACKEND env) — no UI
+                    # override, so the form field is omitted entirely.
+                    data={"job": "1", "media_id": ss["media_id"]},
                     timeout=120,
                 )
             except requests.RequestException as e:
@@ -742,24 +747,50 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                 st.stop()
             jid = resp.json()["job_id"]
             prog = st.progress(0, text="Queued…")
+            # A dead engine used to spin here forever (every poll raised
+            # RequestException -> continue) behind a frozen bar. Count
+            # consecutive misses and bail out with a real message instead.
+            misses, started, last_pct = 0, time.time(), 0
             while True:
                 time.sleep(0.8)
                 try:
                     job = requests.get(f"{API_URL}/align/status/{jid}", timeout=15).json()
-                except requests.RequestException:
+                    misses = 0
+                except (requests.RequestException, ValueError):
+                    misses += 1
+                    elapsed = int(time.time() - started)
+                    prog.progress(
+                        last_pct,
+                        text=f"Reconnecting… ({misses}/5) · {elapsed}s elapsed",
+                    )
+                    if misses >= 5:
+                        prog.empty()
+                        status.update(label="Engine unreachable", state="error")
+                        st.error(
+                            "Lost contact with the caption engine after "
+                            f"{elapsed}s (it may have crashed). Press Generate "
+                            "Captions to retry once the engine is back up."
+                        )
+                        st.stop()
                     continue
+                pct = job.get("progress", 0)
+                last_pct = min(99, int(pct))
                 prog.progress(
-                    min(99, int(job.get("progress", 0))),
-                    text=f"{job.get('stage', 'working…')} · {job.get('progress', 0):.0f}%",
+                    last_pct,
+                    text=f"{job.get('stage', 'working…')} · {pct:.0f}% · "
+                         f"{int(time.time() - started)}s elapsed",
                 )
+                status.update(label=job.get("stage", "working…"))
                 if job.get("status") == "error":
                     # /align/status carries no message — fetch it from the
                     # result endpoint (now surfaces the real job error).
                     msg = None
                     try:
                         msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
-                    except requests.RequestException:
+                    except (requests.RequestException, ValueError):
                         msg = None
+                    prog.empty()
+                    status.update(label="Failed", state="error")
                     st.error(f"Align failed: {msg or 'unknown error'}")
                     st.stop()
                 if job.get("status") == "done":
@@ -774,6 +805,7 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                 st.stop()
             ss["align_result"] = data
             ss["segments"] = [dict(s) for s in data["segments"]]
+            prog.progress(100, text="Done · captions ready")
             status.update(label="Surah detected!", state="complete")
 
     if ss["align_result"] is not None:

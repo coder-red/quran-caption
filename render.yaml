@@ -1,0 +1,50 @@
+# Render blueprint for the caption app.
+#
+# These values MIRROR the live service (quran-caption, srv-dah82nm1egvs73d0di8g)
+# as read from the Render API — applying this blueprint should not change
+# behaviour. Note that for `runtime: python` Render stores these commands under
+# serviceDetails.envSpecificDetails, not serviceDetails directly.
+#
+# The build uses deploy/space/requirements.txt (slim: hosted ASR, no torch).
+# The ROOT requirements.txt would install torch + transformers (~2GB) and is
+# NOT what the live service uses.
+#
+# Render free tier is 512MB. Measured here: cold start ~117MB total (Streamlit
+# 61 + API 56), align pipeline peak 135MB — it fits. The OOM came from
+# unbounded session growth: in deployed mode the preview was inlined as a
+# base64 data URI held in session_state and re-sent on every rerun, which
+# pushed a working session to ~951MB. See frontend/app.py
+# (QCAP_PREVIEW_INLINE_MB) — that cap is what fixes it.
+#
+# GROQ_API_KEY and the other keys are already set on the live service; keep
+# them in the dashboard (sync: false below).
+
+services:
+  - type: web
+    name: quran-caption
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r deploy/space/requirements.txt
+    startCommand: streamlit run frontend/app.py --server.port $PORT --server.address 0.0.0.0 --server.fileWatcherType none --server.headless true --server.enableCORS false --server.enableXsrfProtection true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.3"
+      # Hosted ASR only — no torch on this host.
+      - key: ASR_BACKEND
+        value: groq
+      # Marks deployed mode so the app spawns + talks to the local FastAPI
+      # child instead of assuming an externally-reachable API.
+      - key: SPACE_ID
+        value: "1"
+      # Refuse oversized input before decoding (Render memory safety).
+      - key: QCAP_MAX_MB
+        value: "100"
+      - key: QCAP_MAX_MINUTES
+        value: "30"
+      # Cap on the base64 preview inlined into the player.
+      - key: QCAP_PREVIEW_INLINE_MB
+        value: "8"
+      - key: GROQ_API_KEY
+        sync: false

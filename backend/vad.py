@@ -7,6 +7,7 @@ Chunking follows the WhisperX cut-and-merge pattern: pack speech into
 """
 
 import os
+import threading
 
 import numpy as np
 
@@ -14,9 +15,19 @@ _MAX_CHUNK = 30.0
 _TARGET_CHUNK = 30.0
 # Cache the Silero model module-level: load_silero_vad() costs seconds
 # (torch hub load); re-loading per get_speech_segments() call made a 60s
-# clip pay ~14s of pure reload overhead. Single shared instance is enough
-# (CPU-only, called sequentially in the align pipeline).
+# clip pay ~14s of pure reload overhead.
+#
+# The cache is shared, so BOTH the lazy load and the inference that follows
+# must be serialised. The torch model was previously driven straight from
+# whatever thread called in: /align runs each job in its own daemon thread
+# (backend/main.py::_align_job_worker has no lock), so two concurrent
+# uploads hit the same _VAD_MODEL at once and killed the whole process with
+# STATUS_HEAP_CORRUPTION (0xC0000374, faulting module ntdll.dll, empty
+# stderr) — reproduced deterministically by calling this function from two
+# threads; single-threaded and the ONNX branch both survive. Hold the lock
+# across load+inference, not just around the None check.
 _VAD_MODEL = None
+_VAD_LOCK = threading.Lock()
 
 # Vendored Silero VAD weights (MIT, snakers4/silero-vad — same 2MB model the
 # pip package ships as silero_vad.onnx, opset 16). Lets the neural VAD run
@@ -47,14 +58,15 @@ def get_speech_segments(
             import torch
             from silero_vad import get_speech_timestamps, load_silero_vad
 
-            if _VAD_MODEL is None:
-                _VAD_MODEL = load_silero_vad()
-            ts = get_speech_timestamps(
-                torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)),
-                _VAD_MODEL,
-                sampling_rate=sr,
-                threshold=threshold,
-            )
+            with _VAD_LOCK:
+                if _VAD_MODEL is None:
+                    _VAD_MODEL = load_silero_vad()
+                ts = get_speech_timestamps(
+                    torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)),
+                    _VAD_MODEL,
+                    sampling_rate=sr,
+                    threshold=threshold,
+                )
             return [(t["start"] / sr, t["end"] / sr) for t in ts]
         except Exception:
             pass
