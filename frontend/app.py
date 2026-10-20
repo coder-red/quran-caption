@@ -285,6 +285,8 @@ ss.setdefault("render_job_id", None)
 # media_id of the ORIGINAL video, uploaded separately at the burn-in step
 # when the align ran on a browser-made audio proxy.
 ss.setdefault("video_media_id", None)
+ss.setdefault("video_uploaded", False)
+ss.setdefault("video_meta", None)
 
 
 def api_error(resp: requests.Response):
@@ -1055,6 +1057,12 @@ if ss["align_result"] is not None and ss["segments"]:
                     st.error(f"Video upload failed: {e}")
             else:
                 st.success("Original video uploaded — ready to render.")
+        if not ss.get("video_uploaded"):
+            st.warning(
+                "No original video yet — rendering now would produce an "
+                "**audio-only** MP4 with the captions burned in. Add the "
+                "video above for a proper video with captions."
+            )
 
     render_clicked = st.button("Render MP4 with captions", type="primary", use_container_width=True)
     if render_clicked:
