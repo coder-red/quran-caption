@@ -403,12 +403,16 @@ _FAST_UPLOAD_JS = """
       window.QcapProxy.buildAudioProxy(f, { bitrate: 24000, format: fmt })
         .then(function (out) {
           var base = (f.name || 'clip').replace(/\\.[^.]+$/, '');
-          out.file.name = base + (out.format === 'wav' ? '_audio.wav' : '_audio.ogg');
+          // File.name is read-only — assigning to it silently does nothing.
+          // Build a NEW File with the wanted name (the "_audio" marker tells
+          // the burn-in step that this media has no video in it).
+          var proxyName = base + (out.format === 'wav' ? '_audio.wav' : '_audio.ogg');
+          var proxy = new File([out.file], proxyName, { type: out.file.type });
           window.__qcapOriginalFile = f;
           setStatus('Audio proxy ready: ' + fmt(out.bytes) + ' (was ' +
                     fmt(out.originalBytes) + ', ' +
                     Math.round((1 - out.ratio) * 100) + '% smaller). Uploading…');
-          injectFile(out.file);
+          injectFile(proxy);
         })
         .catch(function (e) {
           setStatus('Could not build the audio proxy (' + (e && e.message || e) +
