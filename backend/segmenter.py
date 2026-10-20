@@ -868,14 +868,19 @@ def segments_from_provider_times(
         if not chain:
             continue
         words_by_ayah: dict[tuple[int, int], list[dict]] = {}
+        used_idx: set[int] = set()
         for word_idx, surah, ayah in chain:
             if not (0 <= word_idx < len(words)):
                 continue
             words_by_ayah.setdefault((surah, ayah), []).append(words[word_idx])
+            used_idx.add(word_idx)
 
-        for (surah, ayah), ws in sorted(
+        ordered = sorted(
             words_by_ayah.items(), key=lambda kv: float(kv[1][0]["start"])
-        ):
+        )
+        _close_chain_holes(ordered, words, used_idx, texts_ar)
+
+        for (surah, ayah), ws in ordered:
             start = min(float(w.get("start", 0.0)) for w in ws)
             end = max(float(w.get("end", start)) for w in ws)
             seg = {
@@ -892,10 +897,100 @@ def segments_from_provider_times(
     segments = [p for seg, ws in all_word_groups
                 for p in _phrase_split(seg, ws, silence_runs, raw_segs)]
     segments.sort(key=lambda s: s["start"])
+    _close_wordless_holes(segments, raw_segs)
     return apply_sync_padding(
         inject_opener_segments(matches, words, segments, silence_runs, raw_segs),
         silence_runs,
     )
+
+
+def _close_chain_holes(ordered, words, used_idx: set[int], texts_ar) -> None:
+    """Give every recited word a caption by closing the detector's holes.
+
+    The detector's chain is sparse: a word the ASR misheard, or a passage
+    the reciter REPEATED, is left out of it. Those words are still in the
+    transcript with correct timestamps, but no segment covered them — so
+    the screen went blank for those seconds while the reciter was plainly
+    still reciting (measured: 19 s of an 8-minute recitation).
+
+    For every hole between two consecutive ayah groups, the unmatched words
+    are assigned to the ayah whose canon text they match best — a repeated
+    passage belongs to the repeated ayah, so its caption simply extends
+    over the repeat. When nothing matches (a genuinely misheard tail) they
+    go to the preceding ayah, whose caption then covers its own tail. Either
+    way no recited second is left uncaptioned.
+    """
+    if len(ordered) < 2:
+        return
+
+    def canon_words(surah: int, ayah: int) -> set[str]:
+        txt = texts_ar.get(f"{surah}:{ayah}", "")
+        return {_normalize(w) for w in txt.split() if w}
+
+    n = len(words)
+    for i in range(len(ordered) - 1):
+        (key_a, ws_a), (key_b, ws_b) = ordered[i], ordered[i + 1]
+        end_a = max(float(w.get("end", 0.0)) for w in ws_a)
+        start_b = min(float(w.get("start", 0.0)) for w in ws_b)
+        if start_b - end_a <= 0.05:
+            continue
+        # the unmatched transcript words inside the hole
+        hole = []
+        for j in range(n):
+            if j in used_idx:
+                continue
+            w = words[j]
+            if end_a - 0.05 <= float(w.get("start", 0.0)) < start_b + 0.05:
+                hole.append((j, w))
+        if not hole:
+            continue
+        hole_norms = [_normalize(w["text"]) for _, w in hole if w.get("text")]
+        if not hole_norms:
+            continue
+        # best-matching neighbour ayah
+        best_key, best_score = None, 0.0
+        for key in (key_b, key_a):
+            cw = canon_words(*key)
+            if not cw:
+                continue
+            hit = sum(1 for h in hole_norms if h in cw)
+            score = hit / len(hole_norms)
+            if score > best_score:
+                best_key, best_score = key, score
+        if best_key is None or best_score < 0.5:
+            best_key = key_a  # unmatched tail -> the preceding ayah
+        ordered_group = ws_a if best_key == key_a else ws_b
+        for j, w in hole:
+            used_idx.add(j)
+            ordered_group.append(w)
+        ordered_group.sort(key=lambda w: float(w.get("start", 0.0)))
+
+
+def _close_wordless_holes(segments: list[dict], raw_segs) -> None:
+    """Keep the caption on across a stretch the ASR gave no words for.
+
+    Some stretches produce no provider word at all (the ASR swallowed them
+    into a neighbouring word's time range). If the VAD says the reciter was
+    SPEAKING there, the caption must not go blank in the middle of his
+    recitation — the gap is bridged. Where the VAD says silence, the gap is
+    a real breath and the caption correctly disappears.
+    """
+    if not raw_segs or len(segments) < 2:
+        return
+    # the silences between the VAD speech runs = the real breaths
+    silences = []
+    for (s1, e1), (s2, e2) in zip(raw_segs, raw_segs[1:]):
+        if e2 - s1 >= 0.10:
+            silences.append((e1, s2))
+    for a, b in zip(segments, segments[1:]):
+        gap = b["start"] - a["end"]
+        if gap <= 0.10:
+            continue
+        # a real breath explains the gap -> the caption correctly disappears
+        if any(ps <= a["end"] + 0.15 and pe >= b["start"] - 0.15
+               for ps, pe in silences):
+            continue
+        a["end"] = round(b["start"] - 0.001, 3)
 
 
 def build_srt(segments: list[dict], language: str = "ar") -> str:
