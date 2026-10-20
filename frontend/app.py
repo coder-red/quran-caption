@@ -186,6 +186,21 @@ div[data-testid="stHtml"] #capwrap { box-shadow: 0 8px 32px rgba(0,0,0,0.55); }
 /* Data editor: allow horizontal scroll on narrow screens */
 div[data-testid="stDataFrame"] { overflow-x: auto; }
 
+/* Fast upload (browser-side audio proxy) */
+.qcap-fast { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;
+             margin: 0.35rem 0 0.6rem; }
+#qcap-fast-btn {
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: #04110c; border: none; border-radius: 9px; padding: 0.5rem 0.9rem;
+  font-weight: 700; font-size: 0.9rem; cursor: pointer;
+  box-shadow: 0 2px 10px rgba(16, 185, 129, 0.25);
+}
+#qcap-fast-btn:hover { filter: brightness(1.08); }
+#qcap-fast-btn:disabled { opacity: 0.6; cursor: progress; }
+.qcap-fast-hint { font-size: 0.8rem; color: #8b93a7; flex: 1 1 260px; }
+.qcap-fast-status { font-size: 0.82rem; color: #34d399; margin: 0.15rem 0 0.4rem; }
+.qcap-fast-status.bad { color: #f87171; }
+
 @media (max-width: 768px) {
   .block-container { padding: 0.8rem 0.8rem 2rem; }
   .hero { padding: 0.6rem 0 0.2rem; }
@@ -267,6 +282,9 @@ ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
+# media_id of the ORIGINAL video, uploaded separately at the burn-in step
+# when the align ran on a browser-made audio proxy.
+ss.setdefault("video_media_id", None)
 
 
 def api_error(resp: requests.Response):
@@ -277,6 +295,120 @@ def api_error(resp: requests.Response):
         return str(detail)
     except Exception:
         return resp.text[:400]
+
+
+# ------------------------------------------------------- fast upload (proxy)
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_asset(name: str) -> str:
+    try:
+        with open(os.path.join(_APP_DIR, name), "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# The browser-side audio proxy encoder. Kept in its own file so it can be
+# linted/tested on its own; inlined here because the page has no route to
+# serve a local asset reliably on every host.
+_PROXY_JS = _read_asset("opus_proxy.js")
+
+# NOTE: a plain string, never an f-string — the JS below is full of braces.
+_FAST_UPLOAD_JS = """
+(function () {
+  if (window.__qcapFastBound) { return; }
+  window.__qcapFastBound = true;
+
+  function statusEl() {
+    var el = document.getElementById('qcap-fast-status');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'qcap-fast-status';
+      el.className = 'qcap-fast-status';
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+  function setStatus(msg, bad) {
+    var el = statusEl();
+    el.textContent = msg || '';
+    el.className = 'qcap-fast-status' + (bad ? ' bad' : '');
+  }
+  window.__qcapFastStatus = setStatus;
+
+  function fmt(n) {
+    if (n > 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
+    return Math.round(n / 1024) + ' KB';
+  }
+
+  function injectFile(file) {
+    var input = document.querySelector('input[data-testid="stFileUploaderDropzoneInput"]')
+             || document.querySelector('input[type=file]');
+    if (!input) {
+      setStatus('Could not find the upload field — reload the page.', true);
+      return;
+    }
+    try {
+      var dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) {
+      setStatus('Could not hand the file to the uploader: ' + e, true);
+    }
+  }
+
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target && ev.target.closest ? ev.target.closest('#qcap-fast-btn') : null;
+    if (!btn) { return; }
+    ev.preventDefault();
+
+    if (!window.QcapProxy) {
+      setStatus('This browser cannot build the audio proxy — use the normal upload.', true);
+      return;
+    }
+    var picker = document.createElement('input');
+    picker.type = 'file';
+    picker.accept = 'video/*,audio/*';
+    picker.style.display = 'none';
+    document.body.appendChild(picker);
+    picker.addEventListener('change', function () {
+      var f = picker.files && picker.files[0];
+      try { picker.remove(); } catch (e) {}
+      if (!f) { return; }
+      setStatus('Extracting audio…');
+      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000 })
+        .then(function (out) {
+          var base = (f.name || 'clip').replace(/\\.[^.]+$/, '');
+          out.file.name = base + '_audio.ogg';
+          window.__qcapOriginalFile = f;
+          setStatus('Audio proxy ready: ' + fmt(out.bytes) + ' (was ' +
+                    fmt(out.originalBytes) + ', ' +
+                    Math.round((1 - out.ratio) * 100) + '% smaller). Uploading…');
+          injectFile(out.file);
+        })
+        .catch(function (e) {
+          setStatus('Could not build the audio proxy (' + (e && e.message || e) +
+                    ') — use the normal upload instead.', true);
+        });
+    });
+    picker.click();
+  });
+})();
+"""
+
+FAST_UPLOAD_HTML = (
+    '<div class="qcap-fast">'
+    '<button id="qcap-fast-btn" type="button">'
+    '&#9889; Instant upload (audio only, ~20x smaller)'
+    '</button>'
+    '<span class="qcap-fast-hint">Extracts the audio in your browser and uploads a '
+    'tiny proxy &mdash; captions in seconds instead of minutes. The burned-in MP4 '
+    'still needs the original video (asked for at the end).</span>'
+    '</div>'
+    '<script>' + _PROXY_JS + _FAST_UPLOAD_JS + '</script>'
+)
 
 
 def fmt_ts(seconds: float) -> str:
@@ -672,9 +804,17 @@ def show_detection(result: dict):
 # ---------------------------------------------------------------- Step 1: upload
 st.markdown('<div class="card"><h3><span class="step-badge">1</span> Upload recitation</h3></div>', unsafe_allow_html=True)
 
+# --- Fast upload (browser-side audio proxy) ---------------------------------
+# A 8-minute recitation video is ~40 MB and the captioning step only ever
+# needs the AUDIO. The browser can extract the audio and encode it to Opus
+# (~3 KB/s) itself, so the upload drops from ~40 MB to ~1.5 MB — the align
+# then starts in seconds instead of minutes on a slow link. The burned-in MP4
+# still needs the original video, so that is offered separately at the end.
+st.html(FAST_UPLOAD_HTML, unsafe_allow_javascript=True)
+
 uploaded = st.file_uploader(
     "Choose a video or audio file",
-    type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a"],
+    type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a", "ogg"],
     label_visibility="collapsed",
     key="file_uploader",
 )
@@ -879,12 +1019,55 @@ if ss["align_result"] is not None and ss["segments"]:
     res_label = st.selectbox("Output resolution", list(RESOLUTIONS.keys()), index=0)
     res_w, res_h = RESOLUTIONS[res_label]
 
+    # When the align ran on a browser-made audio proxy there is no video on
+    # the server, so the burn-in needs the original file uploaded here.
+    _media_name = (ss.get("file_meta") or {}).get("name", "")
+    _audio_only = _media_name.lower().endswith((".ogg", ".opus"))
+    if _audio_only:
+        st.info(
+            "The captions were made from an **audio-only** proxy (the fast upload). "
+            "To burn them into a video, add the original file here — this is the "
+            "one step that needs the full-size upload."
+        )
+        _vfile = st.file_uploader(
+            "Original video (for the burned-in MP4)",
+            type=["mp4", "webm", "mov", "avi", "mkv", "m4a", "mp3", "wav"],
+            label_visibility="collapsed",
+            key="video_uploader",
+        )
+        if _vfile is not None:
+            if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
+                ss["video_media_id"] = uuid.uuid4().hex[:10]
+                ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
+            if not ss.get("video_uploaded"):
+                try:
+                    up = requests.post(
+                        f"{API_URL}/media/{ss['video_media_id']}",
+                        files={"file": (_vfile.name, _vfile.getvalue(), _vfile.type)},
+                        timeout=1800,
+                    )
+                    if up.status_code != 200:
+                        st.error(f"Video upload failed: {api_error(up)}")
+                    else:
+                        ss["video_uploaded"] = True
+                        st.success("Original video uploaded — ready to render.")
+                except requests.RequestException as e:
+                    st.error(f"Video upload failed: {e}")
+            else:
+                st.success("Original video uploaded — ready to render.")
+
     render_clicked = st.button("Render MP4 with captions", type="primary", use_container_width=True)
     if render_clicked:
+        # The burn-in uses the ORIGINAL video when one was supplied, else the
+        # media the captions were made from.
+        _render_media_id = ss.get("video_media_id") or ss["media_id"]
+        if ss.get("video_media_id") and not ss.get("video_uploaded"):
+            st.error("The original video has not finished uploading yet.")
+            st.stop()
         # Render reuses the server-side copy (uploaded once at Generate
         # time) — no second upload. If the engine restarted since, upload
         # once more first.
-        if not ss.get("media_uploaded"):
+        if not ss.get("media_uploaded") and not ss.get("video_media_id"):
             payload = media_bytes()
             if payload is None:
                 st.error("Upload failed: file bytes unavailable — re-select the file.")
@@ -904,9 +1087,12 @@ if ss["align_result"] is not None and ss["segments"]:
                 st.error(f"Could not upload for render: {e}")
                 st.stop()
         try:
+            _render_body = ({"media_id": _render_media_id, "srt": srt_content,
+                              "width": res_w, "height": res_h} if res_w
+                            else {"media_id": _render_media_id, "srt": srt_content})
             resp = requests.post(
                 f"{API_URL}/render",
-                data=style_payload({"media_id": ss["media_id"], "srt": srt_content, "width": res_w, "height": res_h} if res_w else {"media_id": ss["media_id"], "srt": srt_content}),
+                data=style_payload(_render_body),
                 timeout=180,
             )
         except requests.RequestException as e:

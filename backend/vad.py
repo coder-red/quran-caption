@@ -46,6 +46,30 @@ def _silero_available() -> bool:
         return False
 
 
+def vad_backend() -> str:
+    """Which speech detector is ACTIVE right now.
+
+    'torch' = the silero_vad pip package, 'onnx' = the vendored Silero
+    weights through onnxruntime (bit-identical edges to torch, verified),
+    'energy' = the dependency-free RMS fallback.
+
+    This matters because the caption split points come from the detected
+    pauses: the energy fallback finds different (coarser) pauses than
+    Silero, so a clip analysed with 'energy' gets its captions cut at
+    different places than the same clip analysed with 'onnx'. That is the
+    "sync varies per clip" report — so the backend must never silently
+    differ between hosts, and it must be reported.
+    """
+    if _silero_available():
+        return "torch"
+    try:
+        if _onnx_session() is not None:
+            return "onnx"
+    except Exception:
+        pass
+    return "energy"
+
+
 def get_speech_segments(
     audio: np.ndarray, sr: int = 16000, threshold: float = 0.5
 ) -> list[tuple[float, float]]:

@@ -31,6 +31,7 @@ MATCH_GATE = 0.80
 from backend.segmenter import build_srt, segments_from_word_times, segments_from_provider_times, snap_words_to_silence
 from backend.forced_aligner import ForcedAligner
 from backend.providers import get_asr_provider
+from backend.audio_util import extract_audio, is_16k_mono_wav
 
 
 asr_engine = ASREngine()
@@ -140,6 +141,10 @@ def _align_impl(
     sliced_path = None
     temp_slices = []
     owned = media_path is None
+    # True when audio_path points at a temp file WE created (the extracted
+    # 16 kHz mono WAV) and must be deleted when the run ends. The stored
+    # /media copy is never owned — it has to survive for the render step.
+    audio_owned = False
 
     def setp(stage: str, pct: float):
         if p:
@@ -159,17 +164,13 @@ def _align_impl(
         else:
             return ErrorResponse(error="Upload a file or pass media_id")
 
-        if audio_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+        # Extract the audio track once. The result is already 16 kHz mono
+        # WAV, so the ASR provider reuses it as-is instead of running a
+        # second full-file ffmpeg transcode (see backend/audio_util.py).
+        if not is_16k_mono_wav(audio_path):
             old_path = audio_path
-            audio_path, _ = asr_engine.extract_audio(old_path)
-            if owned:
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
-        elif not audio_path.lower().endswith(".wav"):
-            old_path = audio_path
-            audio_path, _ = asr_engine.extract_audio(old_path)
+            audio_path, _ = extract_audio(old_path)
+            audio_owned = True
             if owned:
                 try:
                     os.remove(old_path)
@@ -362,6 +363,7 @@ def _align_impl(
             srt=srt_content,
             vtt=vtt_content,
             matches=match_infos,
+            vad_backend=_vad_backend_name(),
         )
         # Persist a copy so a client timeout / disconnect doesn't lose the
         # (expensive) result — temp/align_result.json survives the cleanup.
@@ -383,6 +385,12 @@ def _align_impl(
                 except OSError:
                     pass
         if owned and audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+        elif audio_owned and audio_path and os.path.exists(audio_path):
+            # Our extracted 16 kHz mono WAV (the stored /media copy stays).
             try:
                 os.remove(audio_path)
             except OSError:
@@ -525,6 +533,16 @@ def _gate_matches(matches):
     return [m for m in matches if m.score >= MATCH_GATE]
 
 
+def _vad_backend_name() -> str:
+    """Active speech detector name, safe to call from any path."""
+    try:
+        from backend.vad import vad_backend
+
+        return vad_backend()
+    except Exception:
+        return "unknown"
+
+
 def _build_align_response(match_infos, words, segments, end_time: float | None = None) -> AlignResponse | None:
     if not segments:
         return None
@@ -557,6 +575,7 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
         srt=srt_content,
         vtt=vtt_content,
         matches=match_infos,
+        vad_backend=_vad_backend_name(),
     )
     try:
         import json
@@ -660,6 +679,24 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None,
 
 MEDIA_FILES: dict[str, str] = {}
 
+_MEDIA_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg", ".opus": "audio/ogg", ".aac": "audio/aac",
+    ".flac": "audio/flac",
+}
+
+
+def _media_type(path: str) -> str:
+    """Content type for a stored media file (video AND audio)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _MEDIA_TYPES:
+        return _MEDIA_TYPES[ext]
+    import mimetypes
+
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+
 
 @app.post("/media/{media_id}")
 async def upload_media(media_id: str, file: UploadFile = File(...)):
@@ -677,7 +714,9 @@ async def get_media(media_id: str):
     path = MEDIA_FILES.get(media_id)
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Media not found")
-    return FileResponse(path, media_type="video/mp4")
+    # Serve the real content type: the fast-upload path stores an Ogg/Opus
+    # audio proxy, and labelling it video/mp4 makes some players refuse it.
+    return FileResponse(path, media_type=_media_type(path))
 
 
 @app.get("/media/{media_id}/preview")
@@ -688,6 +727,11 @@ def media_preview(media_id: str):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Media not found")
     out = os.path.join(TEMP_DIR, f"preview_{media_id}.mp4")
+    # An audio-only source (the fast-upload proxy) needs no video
+    # transcode — re-encoding it to a video container would be pure waste.
+    if os.path.splitext(path)[1].lower() in (".ogg", ".opus", ".mp3", ".wav",
+                                              ".m4a", ".aac", ".flac"):
+        return FileResponse(path, media_type=_media_type(path))
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(path):
         # -avoid_negative_ts make_zero normalizes the ~40ms container A/V
         # start offset user MP4s carry (video start 0.04 vs audio 0.0): both
@@ -955,4 +999,23 @@ async def render_preview_frame(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Liveness + which engines are actually active.
+
+    `vad_backend` is the one that matters for sync: the caption split
+    points come from the detected pauses, and the dependency-free 'energy'
+    fallback finds different pauses than Silero — so a host that silently
+    fell back would cut captions at different places than a host that did
+    not. That is exactly the "sync varies per clip" symptom, so it is
+    reported instead of hidden."""
+    from backend.vad import vad_backend
+
+    try:
+        backend = vad_backend()
+    except Exception:
+        backend = "unknown"
+    return {
+        "status": "ok",
+        "asr_backend": os.getenv("ASR_BACKEND", "groq"),
+        "vad_backend": backend,
+        "vad_ok": backend != "energy",
+    }

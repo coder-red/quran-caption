@@ -54,6 +54,10 @@ class AlignResponse(BaseModel):
     srt: str
     vtt: str
     matches: list[MatchInfo] = []
+    # Which speech detector produced the pause data the captions were cut
+    # on: 'torch' | 'onnx' | 'energy'. The energy fallback finds different
+    # pauses than Silero, so this is reported rather than hidden.
+    vad_backend: str = "unknown"
 
 
 class RenderRequest(BaseModel):
