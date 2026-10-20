@@ -403,15 +403,30 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
     out = []
     prev_b_ar = 0
     prev_b_en = 0
+    n_regions = len(regions)
     for idx, (lo, hi) in enumerate(regions):
-        last = idx == len(regions) - 1
-        b_ar = cut(n_ar, hi)
-        b_en_plain = cut(n_en, hi)
-        b_en = b_en_plain if last else _snap_en_boundary(en_words, prev_b_en, b_en_plain)
+        last = idx == n_regions - 1
+        # Reserve one word per remaining phrase so no phrase is starved: the
+        # proportional cut must never consume words a later phrase still needs.
+        regions_left = n_regions - idx - 1
+        if last:
+            # Last phrase takes EVERYTHING left in both languages, so the tail
+            # of the ayah can never lose its text (this was the "English did
+            # not show" bug: the final 1-2 Arabic words were emitted with an
+            # empty English slice because the proportional EN cut had already
+            # been consumed by the previous phrase).
+            b_ar, b_en = n_ar, n_en
+        else:
+            b_ar = min(cut(n_ar, hi), n_ar - regions_left)
+            b_en_plain = cut(n_en, hi)
+            b_en = _snap_en_boundary(en_words, prev_b_en, b_en_plain)
+            b_en = min(b_en, n_en - regions_left)
         a_ar, a_en = prev_b_ar, prev_b_en
-        # never emit an empty phrase
-        b_ar = max(b_ar, min(a_ar + 1, n_ar)) if b_ar <= a_ar else b_ar
-        b_en = max(b_en, min(a_en + 1, n_en)) if b_en <= a_en else b_en
+        # Never emit a phrase with a language it still has words for.
+        if n_ar and b_ar <= a_ar:
+            b_ar = min(a_ar + 1, n_ar)
+        if n_en and b_en <= a_en:
+            b_en = min(a_en + 1, n_en)
         prev_b_ar, prev_b_en = b_ar, b_en
         phrase = dict(seg)
         pstart = round(float(ws[lo]["start"]), 3)
@@ -486,9 +501,14 @@ def apply_sync_padding(
     (appears after the voice) and squeezed to a flash/zero-length cue the
     live player can never display (`t < end` is never true).
 
-    Real speech alignment is the job of the ASR path upstream — Groq provider
-    words are VAD-anchored (Silero slice bounds) to within ~50ms of wav2vec2
-    forced alignment; this function only nudges *display* timing."""
+    Every emitted cue is guaranteed DISPLAYABLE (start < end): the live player
+    matches on `t >= start && t < end`, so a zero-length cue is never shown at
+    all. When an upstream phrase has no free room (its start was pushed onto or
+    past its own end because the previous caption's end ran into it), its text
+    is CARRIED FORWARD into the next caption that does show, instead of being
+    emitted as an invisible stub — no recited moment is ever left uncaptioned.
+    Real speech alignment is the job of the ASR path upstream; this function
+    only nudges *display* timing."""
     segs = sorted(segments, key=lambda s: s["start"])
     runs = sorted(silence_runs) if silence_runs else []
 
@@ -508,11 +528,25 @@ def apply_sync_padding(
     pushed_start = [
         push_start(max(0.0, round(seg["start"] - LEAD_IN, 3))) for seg in segs
     ]
-    for i, seg in enumerate(segs):
-        seg["start"] = pushed_start[i]
+
+    out: list[dict] = []
     prev_end = 0.0
+    # Text of phrases that had no displayable room, carried forward into the
+    # next cue that does show. Order-preserving: no recited text is lost.
+    carry_ar: list[str] = []
+    carry_en: list[str] = []
+
+    def absorb(target: dict, src: dict) -> dict:
+        merged = dict(target)
+        for key in ("text_ar", "text_en"):
+            a = (merged.get(key) or "").strip()
+            b = (src.get(key) or "").strip()
+            if b and b not in a:
+                merged[key] = (a + " " + b).strip() if a else b
+        return merged
+
     for i, seg in enumerate(segs):
-        seg["start"] = max(round(prev_end + MIN_GAP, 3), seg["start"])
+        start = max(round(prev_end + MIN_GAP, 3), pushed_start[i])
         # Next caption's onset is sacred: nothing here may cover it. The next
         # pushed start only ever moves forward (prev_end clamp above), so
         # capping at it can leave a wider gap but never an overlap.
@@ -521,10 +555,27 @@ def apply_sync_padding(
         end = pull_end(min(round(raw_end[i] + LEAD_OUT, 3), ncap))
         end = max(end,
                   pull_end(min(round(raw_end[i], 3), ncap)),
-                  pull_end(min(round(seg["start"] + MIN_DUR, 3), ncap)))
-        seg["end"] = max(end, seg["start"])
-        prev_end = seg["end"]
-    return segs
+                  pull_end(min(round(start + MIN_DUR, 3), ncap)))
+        if end <= start and i + 1 < len(segs):
+            # No displayable room: this cue would be zero-length and thus
+            # invisible forever (`t < end` never true). Carry its text into
+            # the NEXT cue that shows instead of emitting a stub.
+            carry_ar.append(seg.get("text_ar") or "")
+            carry_en.append(seg.get("text_en") or "")
+            continue
+        if end <= start:
+            # Last phrase with no room: keep a minimal displayable span so the
+            # final words still appear (nothing follows to absorb them).
+            end = round(start + max(MIN_DUR, 0.12), 3)
+        if carry_ar or carry_en:
+            seg = absorb(seg, {"text_ar": " ".join(carry_ar),
+                               "text_en": " ".join(carry_en)})
+            carry_ar, carry_en = [], []
+        seg["start"] = start
+        seg["end"] = end
+        out.append(seg)
+        prev_end = end
+    return out
 
 
 def build_segments(

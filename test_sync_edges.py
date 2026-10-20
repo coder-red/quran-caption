@@ -169,10 +169,20 @@ def test_padding_min_dur_never_steals_next_onset():
     # let the first caption's 0.5s MIN_DUR punch past the next onset, so the
     # next caption appeared ~0.5s AFTER the voice and every caption after it
     # cascaded late. The next onset is sacred: the first caption yields.
+    #
+    # With onsets 0.05s apart there is NO displayable room for the first cue:
+    # its cap (next onset - MIN_GAP) equals its own start, so any cue there
+    # would be zero-length forever (`t < end` never true -- an invisible
+    # caption that silently loses its text). The first phrase is therefore
+    # MERGED into the next, which keeps its text and shows continuously.
     segs = [_seg(51.108, 51.13), _seg(51.158, 52.2)]
     out = apply_sync_padding([dict(s) for s in segs], [])
-    assert out[1]["start"] == 51.138, out  # raw start - lead-in, unpushed
-    assert out[0]["end"] <= out[1]["start"] - MIN_GAP + 1e-9, out
+    assert len(out) == 1, out
+    assert out[0]["start"] == 51.138, out  # raw start - lead-in, unpushed
+    # nothing was lost and nothing was duplicated: identical text collapses
+    assert out[0]["text_ar"] == "x", out
+    for s in out:
+        assert s["end"] > s["start"], out
 
 
 def test_padding_crowded_with_silence_keeps_onsets():
