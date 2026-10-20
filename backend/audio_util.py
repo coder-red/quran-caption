@@ -75,9 +75,10 @@ def ensure_16k_mono(path: str, tmp_dir: str | None = None) -> tuple[str, bool]:
         _silent_unlink(out)
         raise RuntimeError(f"ffmpeg conversion failed: {exc}") from exc
     if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-        msg = r.stderr.decode("utf-8", errors="replace")[-500:]
+        msg = r.stderr.decode("utf-8", errors="replace")
         _silent_unlink(out)
-        raise RuntimeError(f"ffmpeg conversion failed rc={r.returncode}: {msg}")
+        raise RuntimeError(_ffmpeg_error_msg("conversion", None, path,
+                                             r.returncode, msg))
     return out, True
 
 
@@ -108,9 +109,9 @@ def extract_audio(video_path: str, sr: int = SAMPLE_RATE,
     ]
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0 or not os.path.exists(out_path):
-        msg = result.stderr.decode("utf-8", errors="replace")[-600:]
-        _silent_unlink(out_path)
-        raise RuntimeError(f"ffmpeg extract_audio failed rc={result.returncode}: {msg}")
+        msg = result.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(_ffmpeg_error_msg("extract_audio", cmd, video_path,
+                                              result.returncode, msg))
     try:
         import soundfile as sf
 
@@ -119,3 +120,36 @@ def extract_audio(video_path: str, sr: int = SAMPLE_RATE,
     except Exception:
         duration = 0.0
     return out_path, duration
+
+
+def _ffmpeg_error_msg(what: str, cmd, input_path: str, rc: int,
+                       stderr: str) -> str:
+    """A failure message that actually says what went wrong.
+
+    The raw stderr of a failing ffmpeg is thousands of characters of banner
+    with the useful line buried in it, and the tail often holds nothing but
+    the build configuration. Report the input's size and magic bytes too —
+    an empty or truncated upload is the usual real cause.
+    """
+    try:
+        size = os.path.getsize(input_path)
+    except OSError:
+        size = -1
+    try:
+        with open(input_path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        head = b""
+    lines = [ln for ln in stderr.splitlines() if ln.strip()]
+    # Drop the banner/config lines: they are noise that buries the error.
+    interesting = [
+        ln for ln in lines
+        if not ln.startswith(("ffmpeg version", "built with", "configuration:",
+                              "libav", "libsw", "libpost", "  "))
+        and "enable-" not in ln
+    ]
+    tail = "\n".join(interesting[-8:]) if interesting else stderr[-400:]
+    return (
+        f"ffmpeg {what} failed rc={rc} for {os.path.basename(input_path)} "
+        f"({size} bytes, magic={head!r}). ffmpeg: {tail.strip()[:800]}"
+    )

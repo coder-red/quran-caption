@@ -1013,9 +1013,17 @@ async def health():
         backend = vad_backend()
     except Exception:
         backend = "unknown"
+    try:
+        from backend.ffmpeg_capabilities import proxy_formats
+
+        formats = proxy_formats()
+    except Exception:
+        formats = ["wav"]
     return {
         "status": "ok",
         "asr_backend": os.getenv("ASR_BACKEND", "groq"),
         "vad_backend": backend,
         "vad_ok": backend != "energy",
+        # Which fast-upload proxy formats this host's ffmpeg can decode.
+        "proxy_formats": formats,
     }

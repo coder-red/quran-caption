@@ -220,6 +220,20 @@
     return file.arrayBuffer()
       .then(function (buf) { return ctx.decodeAudioData(buf); })
       .then(function (ab) {
+        if (opts.format === 'wav') {
+          return encodeWav16k(ab).then(function (wav) {
+            try { ctx.close(); } catch (e) {}
+            return {
+              file: new File([wav], (file.name || 'clip').replace(/\.[^.]+$/, '') + '.wav',
+                              { type: 'audio/wav' }),
+              bytes: wav.byteLength,
+              originalBytes: file.size,
+              durationSec: ab.duration,
+              ratio: file.size ? wav.byteLength / file.size : 1,
+              format: 'wav'
+            };
+          });
+        }
         return encodeOpusOgg(ab, opts).then(function (res) {
           try { ctx.close(); } catch (e) {}
           var name = (file.name || 'clip').replace(/\.[^.]+$/, '') + '.ogg';
@@ -229,7 +243,8 @@
             bytes: res.bytes.length,
             originalBytes: file.size,
             durationSec: res.durationSec,
-            ratio: file.size ? res.bytes.length / file.size : 1
+            ratio: file.size ? res.bytes.length / file.size : 1,
+            format: 'ogg_opus'
           };
         });
       })
@@ -239,8 +254,52 @@
       });
   }
 
+  /* 16 kHz mono PCM WAV — the universally decodable fallback. Every ffmpeg
+     build can read PCM, so this works even where Opus is unavailable.
+     Resampled with an OfflineAudioContext (the browser's own, so the
+     anti-alias filter is proper rather than a naive decimation). */
+  function encodeWav16k(audioBuffer, targetRate) {
+    targetRate = targetRate || 16000;
+    var frames = Math.max(1, Math.round(audioBuffer.duration * targetRate));
+    var off = new OfflineAudioContext(1, frames, targetRate);
+    var src = off.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(off.destination);
+    src.start(0);
+    return off.startRendering().then(function (rendered) {
+      var data = rendered.getChannelData(0);
+      var n = data.length;
+      var buf = new ArrayBuffer(44 + n * 2);
+      var dv = new DataView(buf);
+      var wstr = function (off, s) {
+        for (var i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i));
+      };
+      wstr(0, 'RIFF');
+      dv.setUint32(4, 36 + n * 2, true);
+      wstr(8, 'WAVE');
+      wstr(12, 'fmt ');
+      dv.setUint32(16, 16, true);       // PCM chunk size
+      dv.setUint16(20, 1, true);        // format = PCM
+      dv.setUint16(22, 1, true);        // channels
+      dv.setUint32(24, targetRate, true);
+      dv.setUint32(28, targetRate * 2, true);   // byte rate
+      dv.setUint16(32, 2, true);        // block align
+      dv.setUint16(34, 16, true);       // bits per sample
+      wstr(36, 'data');
+      dv.setUint32(40, n * 2, true);
+      var off2 = 44;
+      for (var i = 0; i < n; i++) {
+        var s = Math.max(-1, Math.min(1, data[i]));
+        dv.setInt16(off2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        off2 += 2;
+      }
+      return buf;
+    });
+  }
+
   global.QcapProxy = {
     encodeOpusOgg: encodeOpusOgg,
+    encodeWav16k: encodeWav16k,
     buildAudioProxy: buildAudioProxy
   };
 })(window);

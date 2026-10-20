@@ -289,6 +289,25 @@ ss.setdefault("video_uploaded", False)
 ss.setdefault("video_meta", None)
 
 
+def proxy_formats() -> list[str] | None:
+    """Which fast-upload proxy formats the caption engine can decode.
+
+    The engine probes its OWN ffmpeg (it may be imageio-ffmpeg's binary or
+    a system build, and not every build has an Opus decoder). Asking the
+    engine — rather than assuming — means the browser never sends a format
+    the server will fail to decode. Returns None when the engine is not
+    reachable yet (the caller retries later)."""
+    try:
+        r = requests.get(f"{API_URL}/health", timeout=20)
+        if r.status_code == 200:
+            fmts = r.json().get("proxy_formats")
+            if isinstance(fmts, list) and fmts:
+                return [f for f in fmts if f in ("ogg_opus", "wav")]
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
 def api_error(resp: requests.Response):
     try:
         detail = resp.json()
@@ -380,10 +399,11 @@ _FAST_UPLOAD_JS = """
       try { picker.remove(); } catch (e) {}
       if (!f) { return; }
       setStatus('Extracting audio…');
-      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000 })
+      var fmt = window.__qcapProxyFormat || 'ogg_opus';
+      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000, format: fmt })
         .then(function (out) {
           var base = (f.name || 'clip').replace(/\\.[^.]+$/, '');
-          out.file.name = base + '_audio.ogg';
+          out.file.name = base + (out.format === 'wav' ? '_audio.wav' : '_audio.ogg');
           window.__qcapOriginalFile = f;
           setStatus('Audio proxy ready: ' + fmt(out.bytes) + ' (was ' +
                     fmt(out.originalBytes) + ', ' +
@@ -411,6 +431,22 @@ FAST_UPLOAD_HTML = (
     '</div>'
     '<script>' + _PROXY_JS + _FAST_UPLOAD_JS + '</script>'
 )
+
+# Which proxy format the browser should build. The engine knows whether its
+# ffmpeg can decode Ogg/Opus (not every build can), so ask it once and cache.
+_PROXY_FORMAT: str | None = None
+
+
+def proxy_format() -> str:
+    """'ogg_opus' when the engine can decode it, else 'wav' (PCM, universal)."""
+    global _PROXY_FORMAT
+    if _PROXY_FORMAT is None:
+        fmts = proxy_formats()
+        if fmts is None:
+            # Engine not reachable yet — do not cache a guess.
+            return "ogg_opus"
+        _PROXY_FORMAT = "ogg_opus" if "ogg_opus" in fmts else "wav"
+    return _PROXY_FORMAT
 
 
 def fmt_ts(seconds: float) -> str:
@@ -812,7 +848,13 @@ st.markdown('<div class="card"><h3><span class="step-badge">1</span> Upload reci
 # (~3 KB/s) itself, so the upload drops from ~40 MB to ~1.5 MB — the align
 # then starts in seconds instead of minutes on a slow link. The burned-in MP4
 # still needs the original video, so that is offered separately at the end.
-st.html(FAST_UPLOAD_HTML, unsafe_allow_javascript=True)
+st.html(
+    FAST_UPLOAD_HTML.replace(
+        "</script>",
+        "window.__qcapProxyFormat = " + json.dumps(proxy_format()) + ";</script>",
+    ),
+    unsafe_allow_javascript=True,
+)
 
 uploaded = st.file_uploader(
     "Choose a video or audio file",
@@ -1023,8 +1065,9 @@ if ss["align_result"] is not None and ss["segments"]:
 
     # When the align ran on a browser-made audio proxy there is no video on
     # the server, so the burn-in needs the original file uploaded here.
+    # The proxy is named "<original>_audio.ogg" / "<original>_audio.wav".
     _media_name = (ss.get("file_meta") or {}).get("name", "")
-    _audio_only = _media_name.lower().endswith((".ogg", ".opus"))
+    _audio_only = "_audio." in _media_name.lower()
     if _audio_only:
         st.info(
             "The captions were made from an **audio-only** proxy (the fast upload). "
