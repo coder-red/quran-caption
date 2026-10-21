@@ -114,6 +114,35 @@ def test_wordless_gap_bridged_when_speaking_but_not_at_a_breath():
     assert segs2[0]["end"] == 2.0, segs2[0]["end"]
 
 
+def test_last_caption_is_not_held_over_trailing_silence():
+    """The last caption must not stay on for the length of a file that is
+    padded with silence.
+
+    data/test_multisurah.wav ends with ~5.5 s of digital silence; holding
+    the last caption to the end of the FILE left it on screen over pure
+    silence for that whole time. The hold limit is now the voice (neural
+    VAD) and the audible audio, not the file length.
+    """
+    import soundfile as sf
+
+    wav = "data/test_multisurah.wav"
+    if not os.path.exists(wav):
+        return
+    dur = sf.info(wav).duration
+    from backend.main import _align_impl
+
+    resp = _align_impl(None, asr_backend="groq", media_path=wav)
+    data = resp.model_dump() if hasattr(resp, "model_dump") else resp
+    if isinstance(data, dict) and data.get("error"):
+        raise AssertionError(data["error"])
+    last = data["segments"][-1]
+    assert last["end"] < dur - 0.5, (
+        f"the last caption is held to {last['end']} in a {dur:.2f}s file - "
+        "it is sitting over the trailing silence")
+    assert last["end"] > dur - 8.0, (
+        f"the last caption ends at {last['end']}, too early for a {dur:.2f}s file")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

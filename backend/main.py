@@ -203,6 +203,18 @@ def _align_impl(
         if len(audio_full.shape) > 1:
             audio_full = audio_full.mean(axis=1)
         dur = len(audio_full) / sr_full
+        # How far the audio is actually AUDIBLE. The last caption is held
+        # through a trailing outro (music), but not through trailing digital
+        # silence — otherwise the last caption sits on screen for as long as
+        # the file happens to be padded (measured: 6.7 s of caption over
+        # silence on a clip that ends in silence).
+        try:
+            import numpy as np
+
+            loud_idx = np.nonzero(np.abs(audio_full) > 0.004)[0]
+            audible_end = (float(loud_idx[-1]) + 1.0) / sr_full if len(loud_idx) else dur
+        except Exception:
+            audible_end = dur
         setp("analyzing speech…", 8)
 
         # Pause ground truth for caption splitting: real audio silence, NOT
@@ -216,10 +228,21 @@ def _align_impl(
             return ErrorResponse(error="No speech detected in audio")
         setp("speech segments found", 15)
 
+        # How far the last caption is held. It must cover the voice AND a
+        # trailing outro, but not trailing silence: the neural VAD says
+        # where the voice stops, and the amplitude says where the audio
+        # stops. Holding to the end of the FILE left the last caption on
+        # screen for 6.7 s of pure silence on a clip padded with silence.
+        try:
+            last_speech_end = max(float(e) for _, e in raw_segs)
+        except Exception:
+            last_speech_end = dur
+        _hold_end = min(dur, max(last_speech_end, float(audible_end)))
+
         provider = get_asr_provider(asr_backend)
         if provider is not None:
             return _align_with_provider(provider, audio_path, segs, setp,
-                                        sil_runs, raw_segs)
+                                        sil_runs, raw_segs, _hold_end)
 
         setp("transcribing (local model)…", 20)
         wchunks = chunk_for_whisper(segs)
@@ -342,8 +365,8 @@ def _align_impl(
         setp("building captions…", 97)
 
         all_segments.sort(key=lambda s: s["start"])
-        if all_segments and all_segments[-1]["end"] < dur:
-            all_segments[-1]["end"] = round(dur, 3)
+        if all_segments and all_segments[-1]["end"] < _hold_end:
+            all_segments[-1]["end"] = round(_hold_end, 3)
         srt_content = build_srt(all_segments, "ar")
         vtt_content = "WEBVTT\n\n" + srt_content.replace(",", ".")
         words = [WordTimestamp(text=w["text"], start=w["start"], end=w["end"]) for w in all_words]
@@ -586,7 +609,8 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
     return response
 
 
-def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None, raw_segs=None) -> AlignResponse | ErrorResponse:
+def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None, raw_segs=None,
+                         audible_end: float | None = None) -> AlignResponse | ErrorResponse:
     """Hosted-ASR path (groq/gemini): word timestamps come from the provider,
     so detection + ayah segmentation happen without forced alignment.
     sil_runs: audio-truth silence regions for phrase splitting. raw_segs:
@@ -669,6 +693,9 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None,
     try:
         import soundfile as sf
         end_time = sf.info(audio_path).duration
+        # hold the last caption through the audible outro only
+        if audible_end is not None:
+            end_time = min(end_time, float(audible_end))
     except Exception:
         end_time = None
     response = _build_align_response(match_infos, words, segments, end_time=end_time)
