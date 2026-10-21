@@ -544,6 +544,48 @@ if (!window.__qcap) {{
     return w;
   }}
 
+  // The <video> uses object-fit:contain, so a source whose aspect differs
+  // from the 16:9 player box is LETTERBOXED: the picture occupies only the
+  // middle of the element and the rest is black bar. A caption sized to the
+  // ELEMENT therefore runs out over the bars and gets clipped by the frame.
+  // Fit the caption box to the actual PICTURE area instead.
+  function pictureBox(w) {{
+    var vid = w.querySelector('video');
+    if (!vid) return null;
+    var vw = vid.videoWidth, vh = vid.videoHeight;
+    var ew = vid.clientWidth, eh = vid.clientHeight;
+    if (!vw || !vh || !ew || !eh) return null;
+    var scale = Math.min(ew / vw, eh / vh);
+    var pw = vw * scale, ph = vh * scale;
+    return {{ side: Math.max(0, (ew - pw) / 2), top: Math.max(0, (eh - ph) / 2),
+             w: pw, h: ph }};
+  }}
+
+  function fitCaptionBox(w) {{
+    var cap = w.querySelector('#cap');
+    if (!cap) return;
+    var pb = pictureBox(w);
+    if (!pb) return;
+    var st = w.__st || {{}};
+    var pos = st.position || 'bottom';
+    cap.style.left = pb.side + 'px';
+    cap.style.right = pb.side + 'px';
+    if (pos === 'bottom') {{
+      cap.style.top = 'auto';
+      cap.style.bottom = (pb.top + pb.h * 0.07) + 'px';
+      cap.style.transform = 'none';
+    }} else if (pos === 'middle') {{
+      cap.style.top = (pb.top + pb.h / 2) + 'px';
+      cap.style.bottom = 'auto';
+      cap.style.transform = 'translateY(-50%)';
+    }} else {{
+      cap.style.top = (pb.top + pb.h * 0.05) + 'px';
+      cap.style.bottom = 'auto';
+      cap.style.transform = 'none';
+    }}
+    return pb;
+  }}
+
   function applyStyleTo(w) {{
     if (!w) return;
     var cap = w.querySelector('#cap');
@@ -551,9 +593,13 @@ if (!window.__qcap) {{
     if (!cap) return;
     parseWrap(w);
     var st = w.__st;
-    // Scale with player width but clamp: on a 360px phone the raw scale
-    // (48 * 360/1280 = 13.5px) is unreadable for Arabic, so floor at 17px.
-    var fs = Math.max(17, (st.font_size || 48) * ((cap.parentElement.clientWidth || 800) / 1280));
+    var pb = fitCaptionBox(w);
+    // Scale with the PICTURE width (not the element width) so the text is
+    // sized against the part of the frame the viewer actually sees, and
+    // clamp: on a 360px phone the raw scale (48 * 360/1280 = 13.5px) is
+    // unreadable for Arabic, so floor at 17px.
+    var picW = (pb && pb.w) || (cap.parentElement.clientWidth || 800);
+    var fs = Math.max(17, (st.font_size || 48) * (picW / 1280));
     cap.style.fontSize = fs + 'px';
     cap.style.fontFamily = "'" + (st.font_family || 'Segoe UI') + "', sans-serif";
     cap.style.fontWeight = st.bold ? 700 : 400;
@@ -566,10 +612,7 @@ if (!window.__qcap) {{
     }}
     if (st.shadow_size > 0) shadows.push('0 0 '+(st.shadow_size*5)+'px rgba(0,0,0,0.85)');
     cap.style.textShadow = shadows.join(',');
-    var pos = st.position || 'bottom';
-    cap.style.top = pos === 'middle' ? '50%' : (pos === 'top' ? '5%' : 'auto');
-    cap.style.bottom = pos === 'bottom' ? '7%' : 'auto';
-    cap.style.transform = pos === 'middle' ? 'translateY(-50%)' : 'none';
+    // position is handled by fitCaptionBox() (it is picture-relative)
     cap.style.background = st.box ? 'rgba(0,0,0,0.62)' : 'none';
     cap.style.padding = st.box ? '0.15em 0.6em' : '0';
     cap.style.borderRadius = st.box ? '0.35em' : '0';
@@ -636,6 +679,19 @@ if (!window.__qcap) {{
       restorePos();
     }}
   }}, true);
+  // The picture area changes when the player is resized (and the video's
+  // intrinsic size is only known after metadata loads), so the caption box
+  // is re-fitted on both.
+  var fitTimer = null;
+  window.addEventListener('resize', function () {{
+    if (fitTimer) clearTimeout(fitTimer);
+    fitTimer = setTimeout(function () {{
+      var w = curWrap();
+      if (!w) return;
+      fitCaptionBox(w);
+      applyStyleTo(w);
+    }}, 120);
+  }});
   document.addEventListener('seeked', function (e) {{
     if (e.target && e.target.tagName === 'VIDEO' && e.target.closest('#capwrap')) {{
       upd(e.target.closest('#capwrap'), e.target.currentTime);
