@@ -196,5 +196,74 @@ def test_vocative_hole_words_join_the_ayah_they_open():
     assert len(ordered[1][1]) == len(head) + 2, "hole words never assigned"
 
 
+def test_provider_path_word_cues_the_reciter_opener():
+    """The Bismillah is stripped from the detector chain, so it is injected
+    after matching. Injected AFTER the other stages it used to stay one whole
+    phrase AND, worse, the words it doesn't cover were attributed to it: the
+    gap it leaves looked wordless, _close_wordless_holes painted the previous
+    ayah's text over the opener, and padding absorbed that text into the
+    Bismillah cue (measured on the deployed UI: 108:1 read
+    "بِسۡمِ ٱللَّهِ ... أَحَدُۢ" — Kawthar's Bismillah announced 112:4)."""
+    from backend.segmenter import _normalize as _n
+
+    kh = load_ayah_texts()["112:1"].split()
+    bi = load_ayah_texts()["1:1"].split()
+    kw = load_ayah_texts()["108:1"].split()
+    words, t = [], 10.0
+    for w in kh:                                   # 112:1
+        words.append({"text": _normalize(w), "start": round(t, 3),
+                      "end": round(t + 0.6, 3)})
+        t += 0.9
+    t += 2.0                                       # breath before the Bismillah
+    for w in bi:                                   # the opener
+        words.append({"text": _normalize(w), "start": round(t, 3),
+                      "end": round(t + 0.6, 3)})
+        t += 0.9
+    t += 1.0
+    for w in kw:                                   # 108:1
+        words.append({"text": _normalize(w), "start": round(t, 3),
+                      "end": round(t + 0.6, 3)})
+        t += 0.9
+    opener_start, opener_end = words[4]["start"], words[7]["end"]
+
+    class M1:
+        chain = [(i, 112, 1) for i in range(4)]
+        surah = 112
+
+    class M2:
+        chain = [(8 + i, 108, 1) for i in range(3)]
+        surah = 108
+
+    raw_segs = [(10.0, 13.75), (opener_start, opener_end), (words[8]["start"], t)]
+    silences = [(13.75, opener_start), (opener_end, words[8]["start"])]
+    segs = segments_from_provider_times([M1(), M2()], words, silence_runs=silences,
+                                        raw_segs=raw_segs)
+    opener = [s for s in segs
+              if s["start"] >= opener_start - 1e-6 and s["end"] <= opener_end + 1e-6]
+    assert opener, segs
+    assert len(opener) >= 2, "opener is still one whole-phrase caption"
+    for cue in opener:
+        assert 1 <= len(cue["text_ar"].split()) <= WORD_CUE_WORDS, cue
+    assert " ".join(c["text_ar"] for c in opener).split() == bi
+    # nothing from the previous ayah is painted over the opener's audio
+    for cue in segs:
+        if cue["start"] < opener_end and cue["end"] > opener_start:
+            assert set(cue["text_ar"].split()) <= set(bi), cue
+
+
+def test_a_squeezed_cue_keeps_recitation_order_when_carried_forward():
+    """Two words can share one VAD onset (provider stamps overlap). The
+    earlier cue then has no room and its text is carried into the next one —
+    it must still read first, in the order the reciter said it."""
+    a = {"surah": 108, "ayah": 1, "start": 5.0, "end": 5.3,
+         "text_ar": "الكوثر", "text_en": "al-Kawthar."}
+    b = {"surah": 108, "ayah": 2, "start": 5.0, "end": 5.8,
+         "text_ar": "فصل لربك", "text_en": "So pray to your Lord"}
+    out = apply_sync_padding([a, b], silence_runs=[])
+    assert len(out) == 1, out
+    assert out[0]["text_ar"].split()[0] == "الكوثر", out[0]["text_ar"]
+    assert out[0]["text_en"].startswith("al-Kawthar"), out[0]["text_en"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

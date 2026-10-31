@@ -122,7 +122,13 @@ class TestElevenLabsProvider(unittest.TestCase):
         ayahs = [s["ayah"] for s in segs]
         self.assertEqual(sorted(set(ayahs)), [1, 2, 3, 4])
         self.assertEqual(ayahs, sorted(ayahs))
-        self.assertEqual(segs[0]["text_ar"], load_ayah_texts()["1:1"])
+        # The opener is word-tracked too: its cues together spell 1:1.
+        bism = load_ayah_texts()["1:1"].split()
+        opener, rest = [], list(segs)
+        while rest and set(rest[0]["text_ar"].split()) <= set(bism):
+            opener.append(rest.pop(0))
+        self.assertEqual(" ".join(s["text_ar"] for s in opener).split(), bism)
+        self.assertGreaterEqual(len(opener), 2)
 
 
 if __name__ == "__main__":

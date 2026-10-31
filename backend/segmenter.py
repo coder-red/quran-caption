@@ -676,7 +676,11 @@ def apply_sync_padding(
             a = (merged.get(key) or "").strip()
             b = (src.get(key) or "").strip()
             if b and b not in a:
-                merged[key] = (a + " " + b).strip() if a else b
+                # The carried cue is EARLIER in the recitation, so its text
+                # has to read first: appending it produced the next ayah's
+                # word followed by the squeezed one (measured: 108:1/2 read
+                # "فَصَلِّ ٱلْكَوْثَرَ" where the voice says الكوثر then فصل).
+                merged[key] = (b + " " + a).strip() if a else b
         return merged
 
     for i, seg in enumerate(segs):
@@ -1160,12 +1164,16 @@ def segments_from_provider_times(
         cpos = _map_words_to_canon(ws, seg.get("text_ar") or "")
         segments.extend(_phrase_split(seg, ws, silence_runs, raw_segs, cpos))
     segments.sort(key=lambda s: s["start"])
+    # Openers first: a Bismillah's words are stripped from the detector chain,
+    # so before injection the gap they occupy looks wordless and
+    # _close_wordless_holes paints the PREVIOUS ayah's text over the reciter's
+    # opener (measured: Kawthar's Bismillah announced 112:4). Injecting them
+    # here also submits them to subdivide_word_cues like any other phrase.
+    segments = inject_opener_segments(matches, words, segments, silence_runs, raw_segs)
+    segments.sort(key=lambda s: s["start"])
     _close_wordless_holes(segments, raw_segs, silence_runs)
     segments = subdivide_word_cues(segments, words, silence_runs, raw_segs)
-    segments = apply_sync_padding(
-        inject_opener_segments(matches, words, segments, silence_runs, raw_segs),
-        silence_runs,
-    )
+    segments = apply_sync_padding(segments, silence_runs)
     for s in segments:
         s.pop("_ws", None)
     return segments

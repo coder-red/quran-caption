@@ -120,9 +120,16 @@ class TestGroqProvider(unittest.TestCase):
         self.assertEqual(sorted(set(ayahs)), [1, 2, 3, 4])
         self.assertEqual(ayahs, sorted(ayahs))
         self.assertTrue(all(s["start"] <= s["end"] for s in segs))
-        self.assertEqual(segs[0]["text_ar"], load_ayah_texts()["1:1"])
+        # The opener is word-tracked too: its cues together spell 1:1 (it
+        # carries the tag of the surah it precedes).
+        bism = load_ayah_texts()["1:1"].split()
+        opener, rest = [], list(segs)
+        while rest and set(rest[0]["text_ar"].split()) <= set(bism):
+            opener.append(rest.pop(0))
+        self.assertEqual(" ".join(s["text_ar"] for s in opener).split(), bism)
+        self.assertGreaterEqual(len(opener), 2)
         self.assertGreaterEqual(segs[0]["end"], segs[0]["start"])
-        first = " ".join(s["text_ar"] for s in segs[1:]
+        first = " ".join(s["text_ar"] for s in rest
                          if s["surah"] == 112 and s["ayah"] == 1)
         self.assertEqual(first, load_ayah_texts()["112:1"])
         self.assertEqual(segs[-1]["surah"], 112)
