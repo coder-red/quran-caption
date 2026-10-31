@@ -114,6 +114,142 @@ def test_wordless_gap_bridged_when_speaking_but_not_at_a_breath():
     assert segs2[0]["end"] == 2.0, segs2[0]["end"]
 
 
+def test_wordless_gap_with_breath_then_voiced_island():
+    """A gap that starts with a real breath does NOT get painted across it.
+
+    Measured on the 8-min Al-Hashr clip (59:7): the phrase before the gap
+    ended at 145.470, a 0.55 s breath followed, and the ASR then produced no
+    word for 3.2 s while the VAD (and the audio level) said the reciter was
+    still voicing. The old bridge ran the caption straight over the breath
+    (145.470 -> 149.194). Now the caption stops at the breath and comes back
+    over the voiced island only.
+    """
+    segs = [
+        {"surah": 59, "ayah": 7, "start": 136.77, "end": 145.47,
+         "text_ar": "ما أفاء الله على رسوله من أهل القرى فلله وللرسول ولذي",
+         "text_en": "And what Allah restored ... and for the Messenger"},
+        {"surah": 59, "ayah": 7, "start": 149.264, "end": 173.734,
+         "text_ar": "القربى واليتامى والمساكين ...",
+         "text_en": "relatives and orphans ..."},
+    ]
+    raw = [(136.77, 145.47), (146.018, 154.206)]
+    sil = [(145.47, 146.018)]
+    _close_wordless_holes(segs, raw, sil)
+    assert len(segs) == 3, [(s["start"], s["end"]) for s in segs]
+    a, island, b = segs
+    assert a["end"] == 145.47, a["end"]          # blank on the breath
+    assert island["start"] == 146.018            # caption back with the voice
+    assert island["end"] == 149.263              # ... right up to the next phrase
+    assert island["text_ar"] == a["text_ar"]     # it is what he is still saying
+    assert b["start"] == 149.264 and b["end"] == 173.734
+    # no emitted caption may cover the breath
+    for s in segs:
+        assert not (s["start"] < 146.018 and s["end"] > 145.47)
+
+
+def test_wordless_gap_with_several_breaths_keeps_each_island():
+    """Every voiced island between breaths is captioned, every breath blank."""
+    segs = [
+        {"surah": 59, "ayah": 1, "start": 0.0, "end": 1.5, "text_ar": "a", "text_en": "a"},
+        {"surah": 59, "ayah": 1, "start": 8.0, "end": 9.0, "text_ar": "b", "text_en": "b"},
+    ]
+    raw = [(0.0, 1.5), (2.5, 4.0), (5.5, 8.0)]
+    sil = [(1.5, 2.5), (4.0, 5.5)]
+    _close_wordless_holes(segs, raw, sil)
+    iv = [(round(s["start"], 3), round(s["end"], 3)) for s in segs]
+    assert iv == [(0.0, 1.5), (2.5, 3.999), (5.5, 7.999), (8.0, 9.0)], iv
+    for s in segs:  # nothing over 1.5-2.5 or 4.0-5.5
+        assert not (s["start"] < 1.5 and s["end"] > 1.5)
+        assert not (s["start"] < 4.0 and s["end"] > 4.0)
+
+
+
+def test_chain_skipped_word_inside_ayah_gets_caption():
+    """A word the chain skipped MID-ayah must be added to that ayah's words.
+
+    The old hole-closer only looked BETWEEN ayah groups, so a misheard word
+    with chained neighbours on both sides belonged to no group. On the 8-min
+    Al-Hashr clip this left "يحتسموا" (49.887-51.347, 1.42 s of voiced
+    recitation) with no caption at all: the segment ended at the previous
+    word (49.871) and the next phrase began at 51.874.
+    """
+    from backend.segmenter import _close_chain_holes
+
+    words = [
+        {"text": "أ", "start": 46.466, "end": 49.871},
+        {"text": "يحتسموا", "start": 49.887, "end": 51.347},  # chain-skipped
+        {"text": "ب", "start": 51.874, "end": 52.565},
+    ]
+    ordered = [((59, 2), [words[0], words[2]])]
+    used = {0, 2}
+    _close_chain_holes(ordered, words, used, {})
+    assert [w["text"] for w in ordered[0][1]] == ["أ", "يحتسموا", "ب"], ordered
+    assert 1 in used
+
+
+def test_midayah_skipped_word_is_covered_end_to_end():
+    """segments_from_provider_times must cover the skipped mid-ayah word."""
+    w = [
+        {"text": "ما", "start": 0.0, "end": 0.5},
+        {"text": "يحتسموا", "start": 0.6, "end": 1.8},   # not in the chain
+        {"text": "وقذف", "start": 2.0, "end": 2.6},
+    ]
+    matches = [type("M", (), {
+        "chain": [(0, 59, 2), (2, 59, 2)],
+        "surah": type("S", (), {"id": 59, "name_ar": "", "name_en": ""})(),
+        "start_ayah": 2, "end_ayah": 2, "confidence": 1.0,
+    })()]
+    segs = segments_from_provider_times(
+        matches, w, silence_runs=[], raw_segs=[(0.0, 2.6)]
+    )
+    assert len(segs) == 1, [(s["start"], s["end"]) for s in segs]
+    assert segs[0]["end"] >= 1.8, segs[0]
+
+
+def test_repeat_does_not_shift_text_ahead_of_voice():
+    """A repeated passage must show ITS words, not the next words of the ayah.
+
+    Measured on the 8-min Al-Hashr clip (59:15): the whole ayah was recited,
+    then its opening was repeated. The ASR word count (15) exceeded the canon
+    count (11), so the proportional text cut put "ذاقوا وبال" on screen while
+    the reciter was saying "كمثل الذين من قبلهم". The caption text now follows
+    the words actually being recited.
+    """
+    from data.quran_text import _normalize, load_ayah_texts
+    from backend.segmenter import _map_words_to_canon
+
+    canon = load_ayah_texts()["59:15"].split()
+    assert len(canon) >= 11
+    seq = list(range(11)) + [0, 1, 2, 3]      # full ayah, then the opening again
+    words = []
+    t = 0.0
+    for k, i in enumerate(seq):
+        if k == 11:                           # the breath before the repeat
+            t += 0.6
+        words.append({"text": _normalize(canon[i]),
+                      "start": round(t, 3), "end": round(t + 0.25, 3)})
+        t += 0.3
+    pos = _map_words_to_canon(words, " ".join(canon))
+    assert pos[:11] == list(range(11)), pos
+    assert pos[11:] == [0, 1, 2, 3], pos
+
+    matches = [type("M", (), {
+        "chain": [(i, 59, 15) for i in range(len(words))],
+        "surah": type("S", (), {"id": 59, "name_ar": "", "name_en": ""})(),
+        "start_ayah": 15, "end_ayah": 15, "confidence": 1.0,
+    })()]
+    sil = [(3.3, 3.9)]
+    segs = segments_from_provider_times(
+        matches, words, silence_runs=sil, raw_segs=[(0.0, 3.3), (3.9, 6.0)]
+    )
+    assert len(segs) >= 2, [(s["start"], s["end"]) for s in segs]
+    first = segs[0]["text_ar"].split()
+    last = segs[-1]["text_ar"].split()
+    assert first == canon[:11], first
+    # the repeated phrase shows the repeated opening — never the ayah tail
+    assert last == canon[:4], last
+
+
 def test_last_caption_is_not_held_over_trailing_silence():
     """The last caption must not stay on for the length of a file that is
     padded with silence.

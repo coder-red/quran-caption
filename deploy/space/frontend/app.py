@@ -1,12 +1,21 @@
 ﻿import base64
 import json
 import os
+import sys
 import time
 import uuid
 
 import pandas as pd
 import requests
 import streamlit as st
+
+# Sibling modules are imported by directory (not as a package): the app runs
+# as `streamlit run frontend/app.py` both here and on the Space, so the
+# script dir is the only stable anchor.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from sync_inspector import inspector_html as sync_inspector_html  # noqa: E402
 
 API_URL = os.environ.get("QCAP_API_URL", "http://localhost:8000")
 PUBLIC_URL = os.environ.get("QCAP_PUBLIC_URL", API_URL)
@@ -186,6 +195,21 @@ div[data-testid="stHtml"] #capwrap { box-shadow: 0 8px 32px rgba(0,0,0,0.55); }
 /* Data editor: allow horizontal scroll on narrow screens */
 div[data-testid="stDataFrame"] { overflow-x: auto; }
 
+/* Fast upload (browser-side audio proxy) */
+.qcap-fast { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;
+             margin: 0.35rem 0 0.6rem; }
+#qcap-fast-btn {
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: #04110c; border: none; border-radius: 9px; padding: 0.5rem 0.9rem;
+  font-weight: 700; font-size: 0.9rem; cursor: pointer;
+  box-shadow: 0 2px 10px rgba(16, 185, 129, 0.25);
+}
+#qcap-fast-btn:hover { filter: brightness(1.08); }
+#qcap-fast-btn:disabled { opacity: 0.6; cursor: progress; }
+.qcap-fast-hint { font-size: 0.8rem; color: #8b93a7; flex: 1 1 260px; }
+.qcap-fast-status { font-size: 0.82rem; color: #34d399; margin: 0.15rem 0 0.4rem; }
+.qcap-fast-status.bad { color: #f87171; }
+
 @media (max-width: 768px) {
   .block-container { padding: 0.8rem 0.8rem 2rem; }
   .hero { padding: 0.6rem 0 0.2rem; }
@@ -267,13 +291,30 @@ ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
-ss.setdefault("asr_backend", "groq")
+# media_id of the ORIGINAL video, uploaded separately at the burn-in step
+# when the align ran on a browser-made audio proxy.
+ss.setdefault("video_media_id", None)
+ss.setdefault("video_uploaded", False)
+ss.setdefault("video_meta", None)
 
-BACKENDS = {
-    "groq": "Groq (free)",
-    "gemini": "Gemini (free)",
-    "elevenlabs": "ElevenLabs Scribe (precise, needs key)",
-}
+
+def proxy_formats() -> list[str] | None:
+    """Which fast-upload proxy formats the caption engine can decode.
+
+    The engine probes its OWN ffmpeg (it may be imageio-ffmpeg's binary or
+    a system build, and not every build has an Opus decoder). Asking the
+    engine — rather than assuming — means the browser never sends a format
+    the server will fail to decode. Returns None when the engine is not
+    reachable yet (the caller retries later)."""
+    try:
+        r = requests.get(f"{API_URL}/health", timeout=20)
+        if r.status_code == 200:
+            fmts = r.json().get("proxy_formats")
+            if isinstance(fmts, list) and fmts:
+                return [f for f in fmts if f in ("ogg_opus", "wav")]
+    except (requests.RequestException, ValueError):
+        pass
+    return None
 
 
 def api_error(resp: requests.Response):
@@ -284,6 +325,141 @@ def api_error(resp: requests.Response):
         return str(detail)
     except Exception:
         return resp.text[:400]
+
+
+# ------------------------------------------------------- fast upload (proxy)
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_asset(name: str) -> str:
+    try:
+        with open(os.path.join(_APP_DIR, name), "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# The browser-side audio proxy encoder. Kept in its own file so it can be
+# linted/tested on its own; inlined here because the page has no route to
+# serve a local asset reliably on every host.
+_PROXY_JS = _read_asset("opus_proxy.js")
+
+# NOTE: a plain string, never an f-string — the JS below is full of braces.
+_FAST_UPLOAD_JS = """
+(function () {
+  if (window.__qcapFastBound) { return; }
+  window.__qcapFastBound = true;
+
+  function statusEl() {
+    var el = document.getElementById('qcap-fast-status');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'qcap-fast-status';
+      el.className = 'qcap-fast-status';
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+  function setStatus(msg, bad) {
+    var el = statusEl();
+    el.textContent = msg || '';
+    el.className = 'qcap-fast-status' + (bad ? ' bad' : '');
+  }
+  window.__qcapFastStatus = setStatus;
+
+  function fmt(n) {
+    if (n > 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
+    return Math.round(n / 1024) + ' KB';
+  }
+
+  function injectFile(file) {
+    var input = document.querySelector('input[data-testid="stFileUploaderDropzoneInput"]')
+             || document.querySelector('input[type=file]');
+    if (!input) {
+      setStatus('Could not find the upload field — reload the page.', true);
+      return;
+    }
+    try {
+      var dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) {
+      setStatus('Could not hand the file to the uploader: ' + e, true);
+    }
+  }
+
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target && ev.target.closest ? ev.target.closest('#qcap-fast-btn') : null;
+    if (!btn) { return; }
+    ev.preventDefault();
+
+    if (!window.QcapProxy) {
+      setStatus('This browser cannot build the audio proxy — use the normal upload.', true);
+      return;
+    }
+    var picker = document.createElement('input');
+    picker.type = 'file';
+    picker.accept = 'video/*,audio/*';
+    picker.style.display = 'none';
+    document.body.appendChild(picker);
+    picker.addEventListener('change', function () {
+      var f = picker.files && picker.files[0];
+      try { picker.remove(); } catch (e) {}
+      if (!f) { return; }
+      setStatus('Extracting audio…');
+      var fmt = window.__qcapProxyFormat || 'ogg_opus';
+      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000, format: fmt })
+        .then(function (out) {
+          var base = (f.name || 'clip').replace(/\\.[^.]+$/, '');
+          // File.name is read-only — assigning to it silently does nothing.
+          // Build a NEW File with the wanted name (the "_audio" marker tells
+          // the burn-in step that this media has no video in it).
+          var proxyName = base + (out.format === 'wav' ? '_audio.wav' : '_audio.ogg');
+          var proxy = new File([out.file], proxyName, { type: out.file.type });
+          window.__qcapOriginalFile = f;
+          setStatus('Audio proxy ready: ' + fmt(out.bytes) + ' (was ' +
+                    fmt(out.originalBytes) + ', ' +
+                    Math.round((1 - out.ratio) * 100) + '% smaller). Uploading…');
+          injectFile(proxy);
+        })
+        .catch(function (e) {
+          setStatus('Could not build the audio proxy (' + (e && e.message || e) +
+                    ') — use the normal upload instead.', true);
+        });
+    });
+    picker.click();
+  });
+})();
+"""
+
+FAST_UPLOAD_HTML = (
+    '<div class="qcap-fast">'
+    '<button id="qcap-fast-btn" type="button">'
+    '&#9889; Instant upload (audio only, ~20x smaller)'
+    '</button>'
+    '<span class="qcap-fast-hint">Extracts the audio in your browser and uploads a '
+    'tiny proxy &mdash; captions in seconds instead of minutes. The burned-in MP4 '
+    'still needs the original video (asked for at the end).</span>'
+    '</div>'
+    '<script>' + _PROXY_JS + _FAST_UPLOAD_JS + '</script>'
+)
+
+# Which proxy format the browser should build. The engine knows whether its
+# ffmpeg can decode Ogg/Opus (not every build can), so ask it once and cache.
+_PROXY_FORMAT: str | None = None
+
+
+def proxy_format() -> str:
+    """'ogg_opus' when the engine can decode it, else 'wav' (PCM, universal)."""
+    global _PROXY_FORMAT
+    if _PROXY_FORMAT is None:
+        fmts = proxy_formats()
+        if fmts is None:
+            # Engine not reachable yet — do not cache a guess.
+            return "ogg_opus"
+        _PROXY_FORMAT = "ogg_opus" if "ogg_opus" in fmts else "wav"
+    return _PROXY_FORMAT
 
 
 def fmt_ts(seconds: float) -> str:
@@ -377,6 +553,48 @@ if (!window.__qcap) {{
     return w;
   }}
 
+  // The video element uses object-fit:contain, so a source whose aspect differs
+  // from the 16:9 player box is LETTERBOXED: the picture occupies only the
+  // middle of the element and the rest is black bar. A caption sized to the
+  // ELEMENT therefore runs out over the bars and gets clipped by the frame.
+  // Fit the caption box to the actual PICTURE area instead.
+  function pictureBox(w) {{
+    var vid = w.querySelector('video');
+    if (!vid) return null;
+    var vw = vid.videoWidth, vh = vid.videoHeight;
+    var ew = vid.clientWidth, eh = vid.clientHeight;
+    if (!vw || !vh || !ew || !eh) return null;
+    var scale = Math.min(ew / vw, eh / vh);
+    var pw = vw * scale, ph = vh * scale;
+    return {{ side: Math.max(0, (ew - pw) / 2), top: Math.max(0, (eh - ph) / 2),
+             w: pw, h: ph }};
+  }}
+
+  function fitCaptionBox(w) {{
+    var cap = w.querySelector('#cap');
+    if (!cap) return;
+    var pb = pictureBox(w);
+    if (!pb) return;
+    var st = w.__st || {{}};
+    var pos = st.position || 'bottom';
+    cap.style.left = pb.side + 'px';
+    cap.style.right = pb.side + 'px';
+    if (pos === 'bottom') {{
+      cap.style.top = 'auto';
+      cap.style.bottom = (pb.top + pb.h * 0.07) + 'px';
+      cap.style.transform = 'none';
+    }} else if (pos === 'middle') {{
+      cap.style.top = (pb.top + pb.h / 2) + 'px';
+      cap.style.bottom = 'auto';
+      cap.style.transform = 'translateY(-50%)';
+    }} else {{
+      cap.style.top = (pb.top + pb.h * 0.05) + 'px';
+      cap.style.bottom = 'auto';
+      cap.style.transform = 'none';
+    }}
+    return pb;
+  }}
+
   function applyStyleTo(w) {{
     if (!w) return;
     var cap = w.querySelector('#cap');
@@ -384,9 +602,13 @@ if (!window.__qcap) {{
     if (!cap) return;
     parseWrap(w);
     var st = w.__st;
-    // Scale with player width but clamp: on a 360px phone the raw scale
-    // (48 * 360/1280 = 13.5px) is unreadable for Arabic, so floor at 17px.
-    var fs = Math.max(17, (st.font_size || 48) * ((cap.parentElement.clientWidth || 800) / 1280));
+    var pb = fitCaptionBox(w);
+    // Scale with the PICTURE width (not the element width) so the text is
+    // sized against the part of the frame the viewer actually sees, and
+    // clamp: on a 360px phone the raw scale (48 * 360/1280 = 13.5px) is
+    // unreadable for Arabic, so floor at 17px.
+    var picW = (pb && pb.w) || (cap.parentElement.clientWidth || 800);
+    var fs = Math.max(17, (st.font_size || 48) * (picW / 1280));
     cap.style.fontSize = fs + 'px';
     cap.style.fontFamily = "'" + (st.font_family || 'Segoe UI') + "', sans-serif";
     cap.style.fontWeight = st.bold ? 700 : 400;
@@ -399,10 +621,7 @@ if (!window.__qcap) {{
     }}
     if (st.shadow_size > 0) shadows.push('0 0 '+(st.shadow_size*5)+'px rgba(0,0,0,0.85)');
     cap.style.textShadow = shadows.join(',');
-    var pos = st.position || 'bottom';
-    cap.style.top = pos === 'middle' ? '50%' : (pos === 'top' ? '5%' : 'auto');
-    cap.style.bottom = pos === 'bottom' ? '7%' : 'auto';
-    cap.style.transform = pos === 'middle' ? 'translateY(-50%)' : 'none';
+    // position is handled by fitCaptionBox() (it is picture-relative)
     cap.style.background = st.box ? 'rgba(0,0,0,0.62)' : 'none';
     cap.style.padding = st.box ? '0.15em 0.6em' : '0';
     cap.style.borderRadius = st.box ? '0.35em' : '0';
@@ -469,6 +688,19 @@ if (!window.__qcap) {{
       restorePos();
     }}
   }}, true);
+  // The picture area changes when the player is resized (and the video's
+  // intrinsic size is only known after metadata loads), so the caption box
+  // is re-fitted on both.
+  var fitTimer = null;
+  window.addEventListener('resize', function () {{
+    if (fitTimer) clearTimeout(fitTimer);
+    fitTimer = setTimeout(function () {{
+      var w = curWrap();
+      if (!w) return;
+      fitCaptionBox(w);
+      applyStyleTo(w);
+    }}, 120);
+  }});
   document.addEventListener('seeked', function (e) {{
     if (e.target && e.target.tagName === 'VIDEO' && e.target.closest('#capwrap')) {{
       upd(e.target.closest('#capwrap'), e.target.currentTime);
@@ -565,6 +797,46 @@ if (wrap) {{
 """
 
 
+def sync_payload(segments: list[dict], words: list[dict]) -> dict | None:
+    """Fetch (and cache) the audio-vs-caption audit for the current media.
+
+    Cached on a signature of the caption timing, so a style/language rerun is
+    free and a timing edit refetches. The audio half of the analysis is
+    cached server-side per media file, so an edit is cheap there too.
+    """
+    mid = ss.get("media_id")
+    if not mid or not segments:
+        return None
+    sig = (mid, len(segments),
+           round(sum(float(s["start"]) for s in segments), 2),
+           round(sum(float(s["end"]) for s in segments), 2),
+           len(words or []))
+    if ss.get("sync_sig") == sig and ss.get("sync_payload"):
+        return ss["sync_payload"]
+    with st.spinner("Reading the audio (first time for this clip takes a moment)…"):
+        try:
+            resp = requests.post(
+                f"{API_URL}/media/{mid}/sync",
+                json={"segments": segments, "words": words or [],
+                      "max_points": 20000},
+                timeout=1800,
+            )
+        except Exception as e:
+            st.warning(f"Sync inspector unavailable: {e}")
+            return None
+    if resp.status_code != 200:
+        st.warning(f"Sync inspector unavailable: {api_error(resp)}")
+        return None
+    try:
+        pay = resp.json()
+    except Exception as e:
+        st.warning(f"Sync inspector unavailable: {e}")
+        return None
+    ss["sync_sig"] = sig
+    ss["sync_payload"] = pay
+    return pay
+
+
 def media_bytes():
     """File bytes for a (re-)upload to /media.
 
@@ -620,8 +892,28 @@ def ensure_media():
     if DEPLOYED:
         try:
             pv = requests.get(f"{API_URL}/media/{ss['media_id']}/preview", timeout=1200)
+            # Inlining the whole preview as a base64 data URI costs ~33% extra
+            # bytes, holds that copy in session_state for the life of the
+            # session, and re-sends it over the websocket on EVERY rerun
+            # (style/lang/segment edits all rerun). On a 512MB host that
+            # growth is what tips the service into the OOM killer, and it
+            # makes every interaction slow. Only inline while it is cheap.
+            cap_mb = float(os.environ.get("QCAP_PREVIEW_INLINE_MB", "8") or 8)
             if pv.status_code == 200 and pv.content:
-                ss["media_data_uri"] = "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
+                if len(pv.content) <= cap_mb * 1024 * 1024:
+                    ss["media_data_uri"] = (
+                        "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
+                    )
+                else:
+                    ss["media_data_uri"] = None
+                    st.warning(
+                        f"Preview skipped: this clip's preview is "
+                        f"{len(pv.content)/1e6:.0f} MB (over the {cap_mb:.0f} MB "
+                        "inline limit) and inlining it would exhaust this host's "
+                        "memory. Captions below are still correct — set "
+                        "QCAP_PUBLIC_URL to a public API URL to restore the "
+                        "video preview."
+                    )
             elif pv.status_code == 404:
                 # Engine restarted and lost the copy — re-upload next run.
                 ss["media_uploaded"] = False
@@ -659,9 +951,23 @@ def show_detection(result: dict):
 # ---------------------------------------------------------------- Step 1: upload
 st.markdown('<div class="card"><h3><span class="step-badge">1</span> Upload recitation</h3></div>', unsafe_allow_html=True)
 
+# --- Fast upload (browser-side audio proxy) ---------------------------------
+# A 8-minute recitation video is ~40 MB and the captioning step only ever
+# needs the AUDIO. The browser can extract the audio and encode it to Opus
+# (~3 KB/s) itself, so the upload drops from ~40 MB to ~1.5 MB — the align
+# then starts in seconds instead of minutes on a slow link. The burned-in MP4
+# still needs the original video, so that is offered separately at the end.
+st.html(
+    FAST_UPLOAD_HTML.replace(
+        "</script>",
+        "window.__qcapProxyFormat = " + json.dumps(proxy_format()) + ";</script>",
+    ),
+    unsafe_allow_javascript=True,
+)
+
 uploaded = st.file_uploader(
     "Choose a video or audio file",
-    type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a"],
+    type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a", "ogg"],
     label_visibility="collapsed",
     key="file_uploader",
 )
@@ -680,6 +986,9 @@ if uploaded is not None:
         ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
         ss["align_result"] = None
         ss["segments"] = None
+        ss["sync_live"] = False
+        ss["sync_payload"] = None
+        ss["sync_sig"] = None
         ss["lang"] = "ar"
         ss["render_job_id"] = None
         ss["media_id"] = uuid.uuid4().hex[:10]
@@ -695,15 +1004,6 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
         # reused, so just offer Generate again (e.g. after a failed run).
         st.info("File is already on the caption engine — press Generate Captions to (re)run.")
 
-    ss["asr_backend"] = st.selectbox(
-        "Transcription engine",
-        options=list(BACKENDS.keys()),
-        format_func=lambda x: BACKENDS[x],
-        index=list(BACKENDS.keys()).index(ss["asr_backend"])
-        if ss["asr_backend"] in BACKENDS else 0,
-        help="Groq is free and unlimited-ish. Scribe has ~50ms word timing "
-             "but needs ELEVENLABS_API_KEY on the server (4.5h/month free).",
-    )
     generate = st.button("Generate Captions", type="primary", use_container_width=True)
     if generate:
         if not ss.get("media_id"):
@@ -730,8 +1030,9 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                     drop_media_bytes()
                 resp = requests.post(
                     f"{API_URL}/align",
-                    data={"job": "1", "media_id": ss["media_id"],
-                          "asr_backend": ss.get("asr_backend") or "groq"},
+                    # Engine is chosen server-side (ASR_BACKEND env) — no UI
+                    # override, so the form field is omitted entirely.
+                    data={"job": "1", "media_id": ss["media_id"]},
                     timeout=120,
                 )
             except requests.RequestException as e:
@@ -742,24 +1043,50 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                 st.stop()
             jid = resp.json()["job_id"]
             prog = st.progress(0, text="Queued…")
+            # A dead engine used to spin here forever (every poll raised
+            # RequestException -> continue) behind a frozen bar. Count
+            # consecutive misses and bail out with a real message instead.
+            misses, started, last_pct = 0, time.time(), 0
             while True:
                 time.sleep(0.8)
                 try:
                     job = requests.get(f"{API_URL}/align/status/{jid}", timeout=15).json()
-                except requests.RequestException:
+                    misses = 0
+                except (requests.RequestException, ValueError):
+                    misses += 1
+                    elapsed = int(time.time() - started)
+                    prog.progress(
+                        last_pct,
+                        text=f"Reconnecting… ({misses}/5) · {elapsed}s elapsed",
+                    )
+                    if misses >= 5:
+                        prog.empty()
+                        status.update(label="Engine unreachable", state="error")
+                        st.error(
+                            "Lost contact with the caption engine after "
+                            f"{elapsed}s (it may have crashed). Press Generate "
+                            "Captions to retry once the engine is back up."
+                        )
+                        st.stop()
                     continue
+                pct = job.get("progress", 0)
+                last_pct = min(99, int(pct))
                 prog.progress(
-                    min(99, int(job.get("progress", 0))),
-                    text=f"{job.get('stage', 'working…')} · {job.get('progress', 0):.0f}%",
+                    last_pct,
+                    text=f"{job.get('stage', 'working…')} · {pct:.0f}% · "
+                         f"{int(time.time() - started)}s elapsed",
                 )
+                status.update(label=job.get("stage", "working…"))
                 if job.get("status") == "error":
                     # /align/status carries no message — fetch it from the
                     # result endpoint (now surfaces the real job error).
                     msg = None
                     try:
                         msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
-                    except requests.RequestException:
+                    except (requests.RequestException, ValueError):
                         msg = None
+                    prog.empty()
+                    status.update(label="Failed", state="error")
                     st.error(f"Align failed: {msg or 'unknown error'}")
                     st.stop()
                 if job.get("status") == "done":
@@ -774,6 +1101,11 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                 st.stop()
             ss["align_result"] = data
             ss["segments"] = [dict(s) for s in data["segments"]]
+            # A new align means new evidence: drop the old inspector payload.
+            ss["sync_live"] = False
+            ss["sync_payload"] = None
+            ss["sync_sig"] = None
+            prog.progress(100, text="Done · captions ready")
             status.update(label="Surah detected!", state="complete")
 
     if ss["align_result"] is not None:
@@ -840,6 +1172,40 @@ if ss["align_result"] is not None and ss["segments"]:
             unsafe_allow_javascript=True,
         )
 
+    with st.expander(
+        "🔍 Sync inspector — see the audio your captions were timed against",
+        expanded=False,
+    ):
+        st.caption(
+            "One timeline: waveform · Silero speech (green) and measured breaths "
+            "(amber) · caption blocks · ASR word ticks. Wheel = zoom, drag = pan, "
+            "click = jump the player there. Red = a real defect, amber = a boundary "
+            "worth eyeballing."
+        )
+        _words = (ss.get("align_result") or {}).get("words") or []
+        # Reading an hour of audio costs the host real time, so nothing runs
+        # until asked for. Once built it stays live across reruns (the server
+        # caches the audio half, the session caches the whole payload).
+        if st.button("📈 Build the sync chart", key="sync_build"):
+            ss["sync_live"] = True
+        st.caption(
+            "The chart is built on demand so an align never waits on it. "
+            "Press the button once; caption edits afterwards refresh it "
+            "automatically (the audio analysis itself is cached)."
+        )
+
+    # The chart itself lives OUTSIDE the expander: clicking Build reruns the
+    # app, and Streamlit re-renders an expander collapsed (its `expanded` flag
+    # only applies when the element first mounts), so a chart inside would be
+    # hidden the moment it finished building.
+    if ss.get("sync_live"):
+        _pay = sync_payload(ss["segments"], _words)
+        if _pay:
+            st.html(
+                sync_inspector_html(_pay, ss["segments"]),
+                unsafe_allow_javascript=True,
+            )
+
     # ---------------------------------------------------------------- Burn-in & download
     st.markdown("#### Burn-in & download — renders the final MP4 once you like the look")
     st.caption("This is the **only** step that produces a video with captions saved inside it (burned into every frame). The preview above is a live overlay only.")
@@ -847,12 +1213,62 @@ if ss["align_result"] is not None and ss["segments"]:
     res_label = st.selectbox("Output resolution", list(RESOLUTIONS.keys()), index=0)
     res_w, res_h = RESOLUTIONS[res_label]
 
+    # When the align ran on a browser-made audio proxy there is no video on
+    # the server, so the burn-in needs the original file uploaded here.
+    # The proxy is named "<original>_audio.ogg" / "<original>_audio.wav".
+    _media_name = (ss.get("file_meta") or {}).get("name", "")
+    _audio_only = "_audio." in _media_name.lower()
+    if _audio_only:
+        st.info(
+            "The captions were made from an **audio-only** proxy (the fast upload). "
+            "To burn them into a video, add the original file here — this is the "
+            "one step that needs the full-size upload."
+        )
+        _vfile = st.file_uploader(
+            "Original video (for the burned-in MP4)",
+            type=["mp4", "webm", "mov", "avi", "mkv", "m4a", "mp3", "wav"],
+            label_visibility="collapsed",
+            key="video_uploader",
+        )
+        if _vfile is not None:
+            if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
+                ss["video_media_id"] = uuid.uuid4().hex[:10]
+                ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
+            if not ss.get("video_uploaded"):
+                try:
+                    up = requests.post(
+                        f"{API_URL}/media/{ss['video_media_id']}",
+                        files={"file": (_vfile.name, _vfile.getvalue(), _vfile.type)},
+                        timeout=1800,
+                    )
+                    if up.status_code != 200:
+                        st.error(f"Video upload failed: {api_error(up)}")
+                    else:
+                        ss["video_uploaded"] = True
+                        st.success("Original video uploaded — ready to render.")
+                except requests.RequestException as e:
+                    st.error(f"Video upload failed: {e}")
+            else:
+                st.success("Original video uploaded — ready to render.")
+        if not ss.get("video_uploaded"):
+            st.warning(
+                "No original video yet — rendering now would produce an "
+                "**audio-only** MP4 with the captions burned in. Add the "
+                "video above for a proper video with captions."
+            )
+
     render_clicked = st.button("Render MP4 with captions", type="primary", use_container_width=True)
     if render_clicked:
+        # The burn-in uses the ORIGINAL video when one was supplied, else the
+        # media the captions were made from.
+        _render_media_id = ss.get("video_media_id") or ss["media_id"]
+        if ss.get("video_media_id") and not ss.get("video_uploaded"):
+            st.error("The original video has not finished uploading yet.")
+            st.stop()
         # Render reuses the server-side copy (uploaded once at Generate
         # time) — no second upload. If the engine restarted since, upload
         # once more first.
-        if not ss.get("media_uploaded"):
+        if not ss.get("media_uploaded") and not ss.get("video_media_id"):
             payload = media_bytes()
             if payload is None:
                 st.error("Upload failed: file bytes unavailable — re-select the file.")
@@ -872,9 +1288,12 @@ if ss["align_result"] is not None and ss["segments"]:
                 st.error(f"Could not upload for render: {e}")
                 st.stop()
         try:
+            _render_body = ({"media_id": _render_media_id, "srt": srt_content,
+                              "width": res_w, "height": res_h} if res_w
+                            else {"media_id": _render_media_id, "srt": srt_content})
             resp = requests.post(
                 f"{API_URL}/render",
-                data=style_payload({"media_id": ss["media_id"], "srt": srt_content, "width": res_w, "height": res_h} if res_w else {"media_id": ss["media_id"], "srt": srt_content}),
+                data=style_payload(_render_body),
                 timeout=180,
             )
         except requests.RequestException as e:

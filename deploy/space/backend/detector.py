@@ -39,6 +39,7 @@ class SurahDetector:
     def __init__(self, debug_chain: bool = False):
         self._candidates: list[dict] | None = None
         self._flat: list[tuple[int, int, str]] | None = None
+        self._flat_std: list[str] | None = None
         self._word_pos: dict[str, list[int]] | None = None
         self._debug_chain = debug_chain
 
@@ -75,6 +76,15 @@ class SurahDetector:
         from data.quran_text import load_ayah_texts, _normalize, _normalize_std
         texts = load_ayah_texts()
         flat = []
+        # Parallel array of the STANDARD-spelling normalization of the same
+        # canon words. The DP alignment (below) looks the transcript up in a
+        # per-surah table built from `flat`; with the Uthmani form only, every
+        # canon word carrying a superscript alef (السماوات, الكتاب, ...) was
+        # invisible to it, because the ASR writes the plain alef. The word
+        # then went unmatched, the chain skipped it, and the seconds it
+        # covered were left with NO caption at all — the "blank screen while
+        # he is still reciting" defect.
+        flat_std: list[str] = []
         word_pos: dict[str, list[int]] = {}
         compound_idx: list[int] = []
         ayah_start: dict[tuple[int, int], int] = {}
@@ -86,6 +96,7 @@ class SurahDetector:
             for raw_word in text.split():
                 idx = len(flat)
                 flat.append((surah, ayah, _normalize(raw_word)))
+                flat_std.append(_normalize_std(raw_word))
                 for v in {_normalize(raw_word), _normalize_std(raw_word)}:
                     word_pos.setdefault(v, []).append(idx)
                 # Vocative phrases are written as ONE Uthmani word with a
@@ -111,6 +122,7 @@ class SurahDetector:
                 lst.sort()
         self._split_pos = split_pos
         self._flat = flat
+        self._flat_std = flat_std
         self._word_pos = word_pos
         self._ayah_start = ayah_start
 
@@ -540,6 +552,7 @@ class SurahDetector:
         blocks (dropped ASR chunks / recitation skips) show up."""
         import numpy as np
         flat = self._flat
+        flat_std = self._flat_std or []
         word_pos = self._word_pos
         idxs = [i for i, (s, a, w) in enumerate(flat) if s == surah]
         c0, c1 = idxs[0], idxs[-1] + 1
@@ -550,10 +563,22 @@ class SurahDetector:
         pos_arr: dict[str, np.ndarray] = {}
         wgt: dict[str, float] = {}
         for j in range(C):
+            # Register the canon position under BOTH normalizations: the
+            # Uthmani form (dagger alif stripped) and the standard-spelling
+            # form (dagger alif -> alef). The ASR writes plain alefs, so
+            # without the standard alias every canon word with a superscript
+            # alef was unmatched and the seconds it covered had no caption.
             w = flat[c0 + j][2]
             pos_arr.setdefault(w, []).append(j)
-            if w not in wgt:
-                wgt[w] = 1.0 / (1.0 + len(word_pos[w]))
+            if flat_std:
+                ws = flat_std[c0 + j]
+                if ws != w:
+                    pos_arr.setdefault(ws, []).append(j)
+            # IDF weight for BOTH forms, so a common word matched through
+            # the standard alias cannot drag the path off-track.
+            for f in ((w, flat_std[c0 + j]) if flat_std else (w,)):
+                if f not in wgt:
+                    wgt[f] = 1.0 / (1.0 + max(1, len(word_pos.get(f, ()))))
         pos_arr = {w: np.array(v, dtype=np.int64) for w, v in pos_arr.items()}
         dseq = [round(k * C / max(1, T - 1)) for k in range(T)]
         M = 2 * band + 1

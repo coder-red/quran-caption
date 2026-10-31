@@ -17,11 +17,13 @@ from backend.models import (
     ChunkTimestamp,
     Segment,
     ErrorResponse,
+    SyncRequest,
 )
 from backend.aligner import ASREngine
 from backend.detector import SurahDetector
 from backend.renderer import render_captions, render_preview, DEFAULT_STYLES
 from backend.config import TEMP_DIR, CONFIDENCE_THRESHOLD, FFMPEG_PATH
+from backend.audio_util import ensure_16k_mono
 
 # Caption-level match gate (lower than CONFIDENCE_THRESHOLD): disjoint rough
 # matches (e.g. a slightly misheard Fatihah opening at 0.84) are real and
@@ -31,6 +33,7 @@ MATCH_GATE = 0.80
 from backend.segmenter import build_srt, segments_from_word_times, segments_from_provider_times, snap_words_to_silence
 from backend.forced_aligner import ForcedAligner
 from backend.providers import get_asr_provider
+from backend.audio_util import extract_audio, is_16k_mono_wav
 
 
 asr_engine = ASREngine()
@@ -140,6 +143,10 @@ def _align_impl(
     sliced_path = None
     temp_slices = []
     owned = media_path is None
+    # True when audio_path points at a temp file WE created (the extracted
+    # 16 kHz mono WAV) and must be deleted when the run ends. The stored
+    # /media copy is never owned — it has to survive for the render step.
+    audio_owned = False
 
     def setp(stage: str, pct: float):
         if p:
@@ -159,17 +166,13 @@ def _align_impl(
         else:
             return ErrorResponse(error="Upload a file or pass media_id")
 
-        if audio_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+        # Extract the audio track once. The result is already 16 kHz mono
+        # WAV, so the ASR provider reuses it as-is instead of running a
+        # second full-file ffmpeg transcode (see backend/audio_util.py).
+        if not is_16k_mono_wav(audio_path):
             old_path = audio_path
-            audio_path, _ = asr_engine.extract_audio(old_path)
-            if owned:
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
-        elif not audio_path.lower().endswith(".wav"):
-            old_path = audio_path
-            audio_path, _ = asr_engine.extract_audio(old_path)
+            audio_path, _ = extract_audio(old_path)
+            audio_owned = True
             if owned:
                 try:
                     os.remove(old_path)
@@ -202,6 +205,18 @@ def _align_impl(
         if len(audio_full.shape) > 1:
             audio_full = audio_full.mean(axis=1)
         dur = len(audio_full) / sr_full
+        # How far the audio is actually AUDIBLE. The last caption is held
+        # through a trailing outro (music), but not through trailing digital
+        # silence — otherwise the last caption sits on screen for as long as
+        # the file happens to be padded (measured: 6.7 s of caption over
+        # silence on a clip that ends in silence).
+        try:
+            import numpy as np
+
+            loud_idx = np.nonzero(np.abs(audio_full) > 0.004)[0]
+            audible_end = (float(loud_idx[-1]) + 1.0) / sr_full if len(loud_idx) else dur
+        except Exception:
+            audible_end = dur
         setp("analyzing speech…", 8)
 
         # Pause ground truth for caption splitting: real audio silence, NOT
@@ -209,16 +224,33 @@ def _align_impl(
         # silence). Derived from the unmerged VAD segments — one pass, both
         # silence data and speech region used.
         raw_segs = get_speech_segments(audio_full, sr_full)
+        try:
+            # Reused by POST /media/{id}/sync so the inspector does not pay
+            # for a second VAD pass over the same file.
+            _VAD_RUNS_CACHE[_cache_key(media_path or audio_path)] = list(raw_segs)
+        except Exception:
+            pass
         sil_runs = silence_runs_from_segments(raw_segs)
         segs = merge_segments(raw_segs)
         if not segs:
             return ErrorResponse(error="No speech detected in audio")
         setp("speech segments found", 15)
 
+        # How far the last caption is held. It must cover the voice AND a
+        # trailing outro, but not trailing silence: the neural VAD says
+        # where the voice stops, and the amplitude says where the audio
+        # stops. Holding to the end of the FILE left the last caption on
+        # screen for 6.7 s of pure silence on a clip padded with silence.
+        try:
+            last_speech_end = max(float(e) for _, e in raw_segs)
+        except Exception:
+            last_speech_end = dur
+        _hold_end = min(dur, max(last_speech_end, float(audible_end)))
+
         provider = get_asr_provider(asr_backend)
         if provider is not None:
             return _align_with_provider(provider, audio_path, segs, setp,
-                                        sil_runs, raw_segs)
+                                        sil_runs, raw_segs, _hold_end)
 
         setp("transcribing (local model)…", 20)
         wchunks = chunk_for_whisper(segs)
@@ -341,8 +373,8 @@ def _align_impl(
         setp("building captions…", 97)
 
         all_segments.sort(key=lambda s: s["start"])
-        if all_segments and all_segments[-1]["end"] < dur:
-            all_segments[-1]["end"] = round(dur, 3)
+        if all_segments and all_segments[-1]["end"] < _hold_end:
+            all_segments[-1]["end"] = round(_hold_end, 3)
         srt_content = build_srt(all_segments, "ar")
         vtt_content = "WEBVTT\n\n" + srt_content.replace(",", ".")
         words = [WordTimestamp(text=w["text"], start=w["start"], end=w["end"]) for w in all_words]
@@ -362,6 +394,7 @@ def _align_impl(
             srt=srt_content,
             vtt=vtt_content,
             matches=match_infos,
+            vad_backend=_vad_backend_name(),
         )
         # Persist a copy so a client timeout / disconnect doesn't lose the
         # (expensive) result — temp/align_result.json survives the cleanup.
@@ -387,10 +420,25 @@ def _align_impl(
                 os.remove(audio_path)
             except OSError:
                 pass
+        elif audio_owned and audio_path and os.path.exists(audio_path):
+            # Our extracted 16 kHz mono WAV (the stored /media copy stays).
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
 
 ALIGN_JOBS: dict[str, dict] = {}
 ALIGN_JOBS_LOCK = threading.Lock()
+
+# Only one align pipeline may run at a time. Every job is a daemon thread
+# with no other coordination, and the pipeline keeps process-wide state:
+# the shared Silero VAD model (vad._VAD_MODEL), plus the whisper /
+# wav2vec2 models on the local path — all of which are "one resident at a
+# time" by design. Two concurrent /align calls raced on that state and
+# hard-crashed the process (STATUS_HEAP_CORRUPTION 0xC0000374). Jobs still
+# queue and report progress; they just don't interleave.
+ALIGN_PIPELINE_LOCK = threading.Lock()
 
 
 def _purge_old_align_jobs():
@@ -430,16 +478,24 @@ def _align_job_worker(
         job["progress"] = round(float(pct), 1)
 
     try:
-        if media_path:
-            result = _align_impl(
-                None, duration, fps, width, height,
-                asr_backend, p=p, media_path=media_path,
-            )
-        else:
-            result = _align_impl(
-                _JobUpload(filename, content), duration, fps, width, height,
-                asr_backend, p=p,
-            )
+        # Wait our turn before touching any shared model state. Tell the
+        # client it is queued rather than silently parked at 0%.
+        if not ALIGN_PIPELINE_LOCK.acquire(blocking=False):
+            p("waiting for the previous job…", 1.0)
+            ALIGN_PIPELINE_LOCK.acquire()
+        try:
+            if media_path:
+                result = _align_impl(
+                    None, duration, fps, width, height,
+                    asr_backend, p=p, media_path=media_path,
+                )
+            else:
+                result = _align_impl(
+                    _JobUpload(filename, content), duration, fps, width, height,
+                    asr_backend, p=p,
+                )
+        finally:
+            ALIGN_PIPELINE_LOCK.release()
         dumps = result.model_dump()
         job["result"] = dumps
         job["status"] = "error" if "error" in dumps else "done"
@@ -508,6 +564,16 @@ def _gate_matches(matches):
     return [m for m in matches if m.score >= MATCH_GATE]
 
 
+def _vad_backend_name() -> str:
+    """Active speech detector name, safe to call from any path."""
+    try:
+        from backend.vad import vad_backend
+
+        return vad_backend()
+    except Exception:
+        return "unknown"
+
+
 def _build_align_response(match_infos, words, segments, end_time: float | None = None) -> AlignResponse | None:
     if not segments:
         return None
@@ -540,6 +606,7 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
         srt=srt_content,
         vtt=vtt_content,
         matches=match_infos,
+        vad_backend=_vad_backend_name(),
     )
     try:
         import json
@@ -550,7 +617,8 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
     return response
 
 
-def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None, raw_segs=None) -> AlignResponse | ErrorResponse:
+def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None, raw_segs=None,
+                         audible_end: float | None = None) -> AlignResponse | ErrorResponse:
     """Hosted-ASR path (groq/gemini): word timestamps come from the provider,
     so detection + ayah segmentation happen without forced alignment.
     sil_runs: audio-truth silence regions for phrase splitting. raw_segs:
@@ -633,6 +701,9 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None,
     try:
         import soundfile as sf
         end_time = sf.info(audio_path).duration
+        # hold the last caption through the audible outro only
+        if audible_end is not None:
+            end_time = min(end_time, float(audible_end))
     except Exception:
         end_time = None
     response = _build_align_response(match_infos, words, segments, end_time=end_time)
@@ -642,6 +713,24 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None,
 
 
 MEDIA_FILES: dict[str, str] = {}
+
+_MEDIA_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg", ".opus": "audio/ogg", ".aac": "audio/aac",
+    ".flac": "audio/flac",
+}
+
+
+def _media_type(path: str) -> str:
+    """Content type for a stored media file (video AND audio)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _MEDIA_TYPES:
+        return _MEDIA_TYPES[ext]
+    import mimetypes
+
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
 
 
 @app.post("/media/{media_id}")
@@ -660,7 +749,9 @@ async def get_media(media_id: str):
     path = MEDIA_FILES.get(media_id)
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Media not found")
-    return FileResponse(path, media_type="video/mp4")
+    # Serve the real content type: the fast-upload path stores an Ogg/Opus
+    # audio proxy, and labelling it video/mp4 makes some players refuse it.
+    return FileResponse(path, media_type=_media_type(path))
 
 
 @app.get("/media/{media_id}/preview")
@@ -671,6 +762,11 @@ def media_preview(media_id: str):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Media not found")
     out = os.path.join(TEMP_DIR, f"preview_{media_id}.mp4")
+    # An audio-only source (the fast-upload proxy) needs no video
+    # transcode — re-encoding it to a video container would be pure waste.
+    if os.path.splitext(path)[1].lower() in (".ogg", ".opus", ".mp3", ".wav",
+                                              ".m4a", ".aac", ".flac"):
+        return FileResponse(path, media_type=_media_type(path))
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(path):
         # -avoid_negative_ts make_zero normalizes the ~40ms container A/V
         # start offset user MP4s carry (video start 0.04 vs audio 0.0): both
@@ -691,6 +787,83 @@ def media_preview(media_id: str):
         if r is None or r.returncode != 0 or not os.path.exists(out):
             return FileResponse(path, media_type="video/mp4")
     return FileResponse(out, media_type="video/mp4")
+
+
+# ---------------------------------------------------------------- sync audit
+# The sync inspector draws the audio evidence the captions were timed
+# against. Both halves are cached: the VAD runs an /align already measured
+# are reused (so opening the inspector right after aligning is instant), and
+# the computed layers are cached per (media, mtime, resolution).
+_VAD_RUNS_CACHE: dict[tuple[str, float], list] = {}
+_SYNC_LAYERS_CACHE: dict[tuple, dict] = {}
+_SYNC_CACHE_LOCK = threading.Lock()
+_SYNC_CACHE_MAX = 8
+
+
+def _cache_key(path: str) -> tuple[str, float]:
+    try:
+        return (os.path.abspath(path), round(os.path.getmtime(path), 3))
+    except OSError:
+        return (os.path.abspath(path), 0.0)
+
+
+def _sync_layers_for(media_id: str, max_points: int) -> dict:
+    path = MEDIA_FILES.get(media_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Media not found")
+    key = (_cache_key(path), int(max_points))
+    with _SYNC_CACHE_LOCK:
+        hit = _SYNC_LAYERS_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    import soundfile as sf
+    from backend.sync_audit import audio_layers
+
+    wav, owned = ensure_16k_mono(path)
+    try:
+        audio, sr = sf.read(wav, dtype="float32")
+        if getattr(audio, "ndim", 1) > 1:
+            audio = audio.mean(axis=1)
+        with _SYNC_CACHE_LOCK:
+            runs = _VAD_RUNS_CACHE.get(_cache_key(path))
+        layers = audio_layers(audio, sr, max_points=int(max_points),
+                              speech_runs=runs)
+    finally:
+        if owned:
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+
+    with _SYNC_CACHE_LOCK:
+        if len(_SYNC_LAYERS_CACHE) >= _SYNC_CACHE_MAX:
+            _SYNC_LAYERS_CACHE.clear()
+        _SYNC_LAYERS_CACHE[key] = layers
+    return layers
+
+
+@app.post("/media/{media_id}/sync")
+def media_sync(media_id: str, req: SyncRequest):
+    """Audit captions against the media's own audio (sync inspector data).
+
+    Returns peaks, the Silero probability curve, measured speech/silence
+    runs, word stamps and a list of concrete defects. Window-agnostic: the
+    browser zooms client-side, so one payload serves every zoom level.
+    """
+    from backend.sync_audit import analyze
+
+    max_points = max(2000, min(int(req.max_points or 20000), 40000))
+    try:
+        layers = _sync_layers_for(media_id, max_points)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"audio analysis failed: {e}")
+    return analyze(None, 16000,
+                   [s.model_dump() for s in req.segments],
+                   [w.model_dump() for w in req.words],
+                   layers=layers)
 
 
 RENDER_JOBS: dict[str, dict] = {}
@@ -938,4 +1111,31 @@ async def render_preview_frame(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Liveness + which engines are actually active.
+
+    `vad_backend` is the one that matters for sync: the caption split
+    points come from the detected pauses, and the dependency-free 'energy'
+    fallback finds different pauses than Silero — so a host that silently
+    fell back would cut captions at different places than a host that did
+    not. That is exactly the "sync varies per clip" symptom, so it is
+    reported instead of hidden."""
+    from backend.vad import vad_backend
+
+    try:
+        backend = vad_backend()
+    except Exception:
+        backend = "unknown"
+    try:
+        from backend.ffmpeg_capabilities import proxy_formats
+
+        formats = proxy_formats()
+    except Exception:
+        formats = ["wav"]
+    return {
+        "status": "ok",
+        "asr_backend": os.getenv("ASR_BACKEND", "groq"),
+        "vad_backend": backend,
+        "vad_ok": backend != "energy",
+        # Which fast-upload proxy formats this host's ffmpeg can decode.
+        "proxy_formats": formats,
+    }

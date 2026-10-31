@@ -16,7 +16,8 @@ import numpy as np
 import soundfile as sf
 
 from backend.config import FFMPEG_PATH, TEMP_DIR, GROQ_API_KEY, GROQ_MODEL
-from backend.providers.base import ASRProvider, clean_arabic_word
+from backend.audio_util import ensure_16k_mono
+from backend.providers.base import ASRProvider, clean_arabic_word, is_transient_error
 
 try:
     from groq import Groq, RateLimitError
@@ -68,7 +69,7 @@ class GroqProvider(ASRProvider):
         merged slices left per-word residuals up to ~1s). speech_segs: raw
         VAD segments used to cut over-long requests on silence instead of an
         arbitrary time mark. Both default to slices (legacy behavior)."""
-        wav_path = self._ensure_16k_mono(audio_path)
+        wav_path, _owned = self._ensure_16k_mono(audio_path)
         try:
             audio, sr = sf.read(wav_path, dtype="float32")
             if audio.ndim > 1:
@@ -97,27 +98,18 @@ class GroqProvider(ASRProvider):
                 "bounds": bounds,
             }
         finally:
-            try:
-                os.remove(wav_path)
-            except OSError:
-                pass
+            # Only delete a conversion THIS call created. When the input was
+            # already 16 kHz mono we reused it and must leave it alone.
+            if _owned:
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
 
-    def _ensure_16k_mono(self, audio_path: str) -> str:
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        fd, out = tempfile.mkstemp(suffix=".wav", dir=TEMP_DIR)
-        os.close(fd)
-        r = subprocess.run(
-            [
-                FFMPEG_PATH, "-y", "-i", audio_path,
-                "-ac", "1", "-ar", str(SAMPLE_RATE),
-                "-acodec", "pcm_s16le", out,
-            ],
-            capture_output=True,
-        )
-        if r.returncode != 0 or not os.path.exists(out):
-            msg = r.stderr.decode("utf-8", errors="replace")[-500:]
-            raise RuntimeError(f"groq: ffmpeg conversion failed: {msg}")
-        return out
+    def _ensure_16k_mono(self, audio_path: str) -> tuple[str, bool]:
+        """Return (wav_path, owned). `owned` False means the input was already
+        16 kHz mono WAV and was reused as-is — no second ffmpeg transcode."""
+        return ensure_16k_mono(audio_path)
 
     @staticmethod
     def _plan_bounds(slices, dur: float, speech=None) -> list[tuple[float, float]]:
@@ -224,6 +216,16 @@ class GroqProvider(ASRProvider):
                     continue
                 raise RuntimeError(f"groq rate limited: {exc}") from exc
             except Exception as exc:
+                # A dropped connection / timeout used to abort the whole
+                # align on the spot. On a free tier with a shared uplink
+                # that is a routine blip, so retry it with backoff. A 4xx
+                # (bad request, bad key) still fails fast, and the 413
+                # "too large" case keeps its message so the caller can
+                # bisect the slice.
+                if is_transient_error(exc) and attempt < MAX_RETRIES:
+                    last_err = exc
+                    time.sleep(3 * (2 ** attempt))
+                    continue
                 raise RuntimeError(f"groq transcription failed: {exc}") from exc
         raise RuntimeError(f"groq transcription failed: {last_err}")
 

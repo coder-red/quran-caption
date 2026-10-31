@@ -99,47 +99,9 @@ def test_anchor_scribe_cap_tighter_than_groq():
     assert w_scribe[0]["start"] >= 10.5 - SCRIBE_ANCHOR_SHIFT - 1e-9
 
 
-def measure_sync(segments, raw_segs):
-    """capstart-vs-VAD-onset / capend-vs-VAD-offset residuals.
-
-    segments: [{start, end}] caption phrases. raw_segs: [(s, e)] VAD speech.
-    Returns dict(mean_start, std_start, mean_end, std_end, n) — the same
-    metric as the 2026-09-19 Hashr verification (there: -0.08±0.19 /
-    -0.05±0.22). Positive residual = caption edge lags voicing.
-    """
-    import statistics
-
-    ds, de = [], []
-    for seg in segments:
-        onsets = [rs for rs, re in raw_segs if rs <= seg["start"] <= re]
-        if not onsets:
-            cands = [rs for rs, re in raw_segs
-                     if abs(rs - seg["start"]) <= VAD_EDGE_SNAP]
-            if not cands:
-                continue
-            onsets = [min(cands, key=lambda c: abs(c - seg["start"]))]
-        else:
-            onsets = [min(onsets)]
-        offsets = [re for rs, re in raw_segs if rs <= seg["end"] <= re]
-        if not offsets:
-            cands = [re for rs, re in raw_segs
-                     if abs(re - seg["end"]) <= VAD_EDGE_SNAP]
-            if not cands:
-                continue
-            offsets = [min(cands, key=lambda c: abs(c - seg["end"]))]
-        else:
-            offsets = [max(offsets)]
-        ds.append(round(seg["start"] - onsets[0], 3))
-        de.append(round(seg["end"] - offsets[0], 3))
-    if not ds:
-        return {"n": 0}
-    return {
-        "n": len(ds),
-        "mean_start": round(statistics.mean(ds), 3),
-        "std_start": round(statistics.pstdev(ds), 3) if len(ds) > 1 else 0.0,
-        "mean_end": round(statistics.mean(de), 3),
-        "std_end": round(statistics.pstdev(de), 3) if len(de) > 1 else 0.0,
-    }
+# measure_sync lives in backend/sync_audit.py (the sync inspector uses the
+# same metric); re-exported here so this suite keeps asserting its contract.
+from backend.sync_audit import measure_sync  # noqa: E402
 
 
 def test_measure_sync_perfect_alignment_scores_zero():

@@ -11,6 +11,7 @@ phrase splitting, clamping), so only the timestamp source changes.
 import os
 import subprocess
 import tempfile
+import time
 from typing import Optional
 
 import numpy as np
@@ -19,7 +20,8 @@ import soundfile as sf
 from backend.config import (
     FFMPEG_PATH, TEMP_DIR, ELEVENLABS_API_KEY, ELEVENLABS_MODEL,
 )
-from backend.providers.base import ASRProvider, clean_arabic_word
+from backend.audio_util import ensure_16k_mono
+from backend.providers.base import ASRProvider, clean_arabic_word, is_transient_error
 from backend.providers.groq import (
     _anchor_words_to_vad, _plan_bounds_request, MAX_ANCHOR_SHIFT,
 )
@@ -68,7 +70,7 @@ class ElevenLabsProvider(ASRProvider):
                    progress_cb: Optional[callable] = None,
                    anchor_slices=None,
                    speech_segs=None) -> dict:
-        wav_path = self._ensure_16k_mono(audio_path)
+        wav_path, _owned = self._ensure_16k_mono(audio_path)
         try:
             audio, sr = sf.read(wav_path, dtype="float32")
             if audio.ndim > 1:
@@ -98,27 +100,17 @@ class ElevenLabsProvider(ASRProvider):
                 "bounds": bounds,
             }
         finally:
-            try:
-                os.remove(wav_path)
-            except OSError:
-                pass
+            # Only delete a conversion THIS call created.
+            if _owned:
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
 
-    def _ensure_16k_mono(self, audio_path: str) -> str:
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        fd, out = tempfile.mkstemp(suffix=".wav", dir=TEMP_DIR)
-        os.close(fd)
-        r = subprocess.run(
-            [
-                FFMPEG_PATH, "-y", "-i", audio_path,
-                "-ac", "1", "-ar", str(SAMPLE_RATE),
-                "-acodec", "pcm_s16le", out,
-            ],
-            capture_output=True,
-        )
-        if r.returncode != 0 or not os.path.exists(out):
-            msg = r.stderr.decode("utf-8", errors="replace")[-500:]
-            raise RuntimeError(f"elevenlabs: ffmpeg conversion failed: {msg}")
-        return out
+    def _ensure_16k_mono(self, audio_path: str) -> tuple[str, bool]:
+        """Return (wav_path, owned). `owned` False means the input was already
+        16 kHz mono WAV and was reused as-is — no second ffmpeg transcode."""
+        return ensure_16k_mono(audio_path)
 
     def _call(self, audio: np.ndarray, s: float, e: float) -> list[dict]:
         lo = max(0, int(s * SAMPLE_RATE))
@@ -131,19 +123,30 @@ class ElevenLabsProvider(ASRProvider):
         fd, tmp = tempfile.mkstemp(suffix=".wav", dir=TEMP_DIR)
         os.close(fd)
         sf.write(tmp, seg, SAMPLE_RATE)
+        res = None
         try:
-            with open(tmp, "rb") as f:
-                kwargs = {
-                    "model_id": self.model,
-                    "file": f,
-                    "timestamps_granularity": "word",
-                    "diarize": False,
-                }
-                if self.language:
-                    kwargs["language_code"] = self.language
-                res = self._api().speech_to_text.convert(**kwargs)
-        except Exception as exc:
-            raise RuntimeError(f"elevenlabs transcription failed: {exc}") from exc
+            for attempt in range(4):
+                try:
+                    with open(tmp, "rb") as f:
+                        kwargs = {
+                            "model_id": self.model,
+                            "file": f,
+                            "timestamps_granularity": "word",
+                            "diarize": False,
+                        }
+                        if self.language:
+                            kwargs["language_code"] = self.language
+                        res = self._api().speech_to_text.convert(**kwargs)
+                    break
+                except Exception as exc:
+                    # Retry transient network failures (dropped connection,
+                    # timeout) with backoff instead of aborting a
+                    # multi-minute align over one blip.
+                    if is_transient_error(exc) and attempt < 3:
+                        time.sleep(3 * (2 ** attempt))
+                        continue
+                    raise RuntimeError(
+                        f"elevenlabs transcription failed: {exc}") from exc
         finally:
             try:
                 os.remove(tmp)

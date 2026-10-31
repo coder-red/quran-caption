@@ -7,6 +7,7 @@ Chunking follows the WhisperX cut-and-merge pattern: pack speech into
 """
 
 import os
+import threading
 
 import numpy as np
 
@@ -14,9 +15,19 @@ _MAX_CHUNK = 30.0
 _TARGET_CHUNK = 30.0
 # Cache the Silero model module-level: load_silero_vad() costs seconds
 # (torch hub load); re-loading per get_speech_segments() call made a 60s
-# clip pay ~14s of pure reload overhead. Single shared instance is enough
-# (CPU-only, called sequentially in the align pipeline).
+# clip pay ~14s of pure reload overhead.
+#
+# The cache is shared, so BOTH the lazy load and the inference that follows
+# must be serialised. The torch model was previously driven straight from
+# whatever thread called in: /align runs each job in its own daemon thread
+# (backend/main.py::_align_job_worker has no lock), so two concurrent
+# uploads hit the same _VAD_MODEL at once and killed the whole process with
+# STATUS_HEAP_CORRUPTION (0xC0000374, faulting module ntdll.dll, empty
+# stderr) — reproduced deterministically by calling this function from two
+# threads; single-threaded and the ONNX branch both survive. Hold the lock
+# across load+inference, not just around the None check.
 _VAD_MODEL = None
+_VAD_LOCK = threading.Lock()
 
 # Vendored Silero VAD weights (MIT, snakers4/silero-vad — same 2MB model the
 # pip package ships as silero_vad.onnx, opset 16). Lets the neural VAD run
@@ -35,6 +46,30 @@ def _silero_available() -> bool:
         return False
 
 
+def vad_backend() -> str:
+    """Which speech detector is ACTIVE right now.
+
+    'torch' = the silero_vad pip package, 'onnx' = the vendored Silero
+    weights through onnxruntime (bit-identical edges to torch, verified),
+    'energy' = the dependency-free RMS fallback.
+
+    This matters because the caption split points come from the detected
+    pauses: the energy fallback finds different (coarser) pauses than
+    Silero, so a clip analysed with 'energy' gets its captions cut at
+    different places than the same clip analysed with 'onnx'. That is the
+    "sync varies per clip" report — so the backend must never silently
+    differ between hosts, and it must be reported.
+    """
+    if _silero_available():
+        return "torch"
+    try:
+        if _onnx_session() is not None:
+            return "onnx"
+    except Exception:
+        pass
+    return "energy"
+
+
 def get_speech_segments(
     audio: np.ndarray, sr: int = 16000, threshold: float = 0.5
 ) -> list[tuple[float, float]]:
@@ -47,14 +82,15 @@ def get_speech_segments(
             import torch
             from silero_vad import get_speech_timestamps, load_silero_vad
 
-            if _VAD_MODEL is None:
-                _VAD_MODEL = load_silero_vad()
-            ts = get_speech_timestamps(
-                torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)),
-                _VAD_MODEL,
-                sampling_rate=sr,
-                threshold=threshold,
-            )
+            with _VAD_LOCK:
+                if _VAD_MODEL is None:
+                    _VAD_MODEL = load_silero_vad()
+                ts = get_speech_timestamps(
+                    torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)),
+                    _VAD_MODEL,
+                    sampling_rate=sr,
+                    threshold=threshold,
+                )
             return [(t["start"] / sr, t["end"] / sr) for t in ts]
         except Exception:
             pass
@@ -62,6 +98,69 @@ def get_speech_segments(
     if onnx_segs is not None:
         return onnx_segs
     return _energy_segments(audio, sr)
+
+
+def speech_probs(
+    audio: np.ndarray, sr: int = 16000, hop_s: float = 0.05
+) -> tuple[np.ndarray, str]:
+    """Per-hop speech-probability curve for the sync inspector.
+
+    Returns (curve, backend) where curve[i] is 0..1 over the hop starting at
+    i*hop_s, and backend is 'onnx' (true Silero probability — the same signal
+    the pause decisions were made from) or 'energy' (normalized RMS, an
+    approximation reported as such).
+
+    DIAGNOSTIC ONLY: no caption timing is derived from this. Deliberately
+    avoids the torch model (the shared torch instance must only ever be
+    driven under _VAD_LOCK by get_speech_segments — concurrent use crashed
+    the process); ONNX is bit-identical on edges anyway."""
+    x = np.ascontiguousarray(audio, dtype=np.float32).ravel()
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32), "energy"
+    probs = _onnx_probs(x, sr)
+    if probs is not None:
+        return _bucket_max(probs, sr, hop_s), "onnx"
+    rms = rms_frames(x, sr, hop_s)
+    if rms.size == 0:
+        return rms, "energy"
+    ref = float(np.percentile(rms, 95))
+    if ref <= 0:
+        ref = float(rms.max()) or 1.0
+    return np.clip(rms / max(ref, 1e-9), 0.0, 1.0).astype(np.float32), "energy"
+
+
+def _bucket_max(probs: list[float], sr: int, hop_s: float) -> np.ndarray:
+    """Collapse per-512-sample probs onto hop buckets using the max, so a
+    short speech burst cannot vanish between two display columns."""
+    hop = max(1, int(round(hop_s * sr)))
+    n = int(np.ceil(len(probs) * _WIN / hop))
+    out = np.zeros(n, dtype=np.float32)
+    for j, p in enumerate(probs):
+        b = (j * _WIN) // hop
+        if b < n and p > out[b]:
+            out[b] = p
+    # 32ms model windows vs a 50ms display hop leave holes; carry the last
+    # value forward so the curve is continuous (at most one hop of smear).
+    for i in range(1, n):
+        if out[i] == 0.0 and out[i - 1] > 0.0:
+            out[i] = out[i - 1]
+    return out
+
+
+def rms_frames(
+    audio: np.ndarray, sr: int = 16000, hop_s: float = 0.03
+) -> np.ndarray:
+    """RMS amplitude per hop (cumsum, one pass — cheap on hour-long clips)."""
+    x = np.asarray(audio, dtype=np.float64).ravel()
+    hop = max(1, int(round(hop_s * sr)))
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    n = int(np.ceil(x.size / hop))
+    edges = np.minimum(np.arange(n + 1, dtype=np.int64) * hop, x.size)
+    c = np.concatenate([[0.0], np.cumsum(x * x)])
+    total = c[edges[1:]] - c[edges[:-1]]
+    return np.sqrt(total / np.maximum(1, edges[1:] - edges[:-1])).astype(
+        np.float32)
 
 
 def _onnx_session():
@@ -88,14 +187,16 @@ def _onnx_session():
     return _ONNX_SESSION
 
 
-def _onnx_segments(
-    audio: np.ndarray, sr: int = 16000, threshold: float = 0.5
-) -> list[tuple[float, float]] | None:
-    """Silero VAD through ONNX Runtime with numpy only. Feeds the model
-    exactly like OnnxWrapper.audio_forward (512-sample windows, 64-sample
-    carried context, carried RNN state) and replicates
-    get_speech_timestamps post-processing bit-for-bit, so edges are
-    identical to the torch path."""
+_WIN = 512
+
+
+def _onnx_probs(audio: np.ndarray, sr: int = 16000) -> list[float] | None:
+    """Raw Silero speech probability per 512-sample window (32ms at 16k).
+
+    Feeds the model exactly like OnnxWrapper.audio_forward (512-sample
+    windows, 64-sample carried context, carried RNN state). The segment
+    builder and the sync inspector share this so the curve the user sees is
+    literally the signal the pause decisions were made from."""
     if sr != 16000:
         return None
     session = _onnx_session()
@@ -104,7 +205,7 @@ def _onnx_segments(
     try:
         import numpy as _np
 
-        WIN, CTX = 512, 64
+        WIN, CTX = _WIN, 64
         x = _np.ascontiguousarray(audio, dtype=_np.float32).ravel()
         n = len(x)
         state = _np.zeros((2, 1, 128), dtype=_np.float32)
@@ -120,9 +221,22 @@ def _onnx_segments(
                 "input": inp, "state": state, "sr": sr_arr})
             probs.append(float(out.ravel()[0]))
             context = inp[0, -CTX:]
-        return _tstamps_from_probs(probs, n, sr, threshold)
+        return probs
     except Exception:
         return None
+
+
+def _onnx_segments(
+    audio: np.ndarray, sr: int = 16000, threshold: float = 0.5
+) -> list[tuple[float, float]] | None:
+    """Silero VAD segments through ONNX Runtime with numpy only (see
+    _onnx_probs). Post-processing is a bit-for-bit port of
+    get_speech_timestamps, so edges are identical to the torch path."""
+    probs = _onnx_probs(audio, sr)
+    if probs is None:
+        return None
+    n = len(np.ascontiguousarray(audio, dtype=np.float32).ravel())
+    return _tstamps_from_probs(probs, n, sr, threshold)
 
 
 def _tstamps_from_probs(

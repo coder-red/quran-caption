@@ -23,6 +23,10 @@ MIN_DUR = 0.5
 # unreliable evidence, so they must clear a higher bar to split.
 SILENCE_SPLIT = 0.4
 PAUSE_GAP = 1.0
+# Minimum VAD gap that counts as a real breath when a wordless stretch is
+# bridged (_close_wordless_holes). Matches silence_runs_from_segments'
+# min_silence: shorter dips are articulation and may stay captioned.
+BREATH_MIN = 0.25
 MIN_PHRASE_WORDS = 3
 MIN_PHRASE_DUR = 1.2
 # Max disagreement (seconds) between a provider word edge and the VAD speech
@@ -40,6 +44,26 @@ VAD_CLAMP_TOL = 0.6
 # residual overlap with the next phrase).
 VAD_EDGE_SNAP = 1.5
 _EN_BREAK_CHARS = set(".;!?،،:,")
+
+# Madd (elongation) tail hold — idea stolen from qurani.io's quran-timing-helper
+# (--madd-fix): a reciter holding a madd vowel for seconds while the provider
+# stamps the word end early leaves the caption dropping mid-vowel.
+# _vad_clamp_bounds already recovers holds <= VAD_EDGE_SNAP, but ONLY when the
+# VAD segment offset sits that close; in continuous recitation the speech
+# segment runs on for ayahs and the early stamp stands. Madd is voiced, so the
+# fix extends a madd-word phrase end into CONTINUING voicing (the same raw VAD
+# segment still covers the edge), stopped by real silence, the next phrase, or
+# the cap below — never into a pause, never overlapping. Mid-verse cap 1.8s,
+# verse-final cap 3.5s (mujawwad holds; murattal rarely exceeds 1s).
+MADD_MID_EXTEND = 1.8
+MADD_FINAL_EXTEND = 3.5
+# Explicit Uthmani madd marks: maddah-above U+0653, superscript alef U+0670
+# (very common in Uthmani: الرحمن, الصراط, يايها...).
+_MADD_MARKS = {"\u0653", "\u0670"}
+# Long-vowel letters that can carry a held madd (broad check, qurani "broad"
+# mode): plain + wasla/maddah/hamza alef forms, waw, ya.
+_MADD_VOWELS = {"\u0627", "\u0671", "\u0622", "\u0623", "\u0625",
+                "\u0648", "\u064a"}
 
 # Uthmani orthography writes some long-a words with a superscript alif
 # (U+0670, e.g. ٱلشَّيْطَٰنِ) that _normalize strips but ASR reads back as a
@@ -141,6 +165,45 @@ def snap_words_to_silence(
     return out
 
 
+def _has_madd(raw_word: str) -> bool:
+    """True when a RAW Uthmani word can carry a held elongation: an explicit
+    madd mark (maddah U+0653, superscript alef U+0670) or a long-vowel letter
+    (the usual verse-final madd-عارض landing spot: نستعين، الرحيم). Raw text
+    only — _normalize strips every one of these marks, so this must run on
+    seg["text_ar"] (which is raw Uthmani), never on normalized text."""
+    if not raw_word:
+        return False
+    for ch in raw_word:
+        if ch in _MADD_MARKS or ch in _MADD_VOWELS:
+            return True
+    return False
+
+
+def _madd_extend(end: float, raw_word: str, verse_final: bool,
+                 silence_runs: list | None,
+                 raw_segs: list[tuple[float, float]],
+                 cap_next: float) -> float:
+    """Hold a caption over a madd elongation the provider cut early. Extends
+    end into continuing VOICING only: the same raw VAD segment must still
+    cover end (madd is voiced — a segment edge here means voicing stopped and
+    there is nothing to hold). Stops at the first real silence, at the VAD
+    segment offset, at cap_next (next phrase start - MIN_GAP), or after
+    MADD_FINAL_EXTEND (verse-final phrase) / MADD_MID_EXTEND. Returns end
+    unchanged when the last word carries no madd evidence. Rounded."""
+    if not raw_segs or not _has_madd(raw_word):
+        return end
+    covers = [re for rs, re in raw_segs if rs <= end <= re]
+    if not covers:
+        return end
+    limit = min(end + (MADD_FINAL_EXTEND if verse_final else MADD_MID_EXTEND),
+                max(covers), cap_next)
+    if silence_runs:
+        for rs, re in silence_runs:
+            if rs > end - 0.03 and rs < limit:
+                limit = min(limit, rs)
+    return round(max(end, limit), 3)
+
+
 def _vad_clamp_bounds(
     start: float, end: float,
     first: dict, last: dict,
@@ -234,8 +297,65 @@ def _silence_between(
     return total
 
 
+def _map_words_to_canon(ws: list[dict], text_ar: str) -> list[int | None] | None:
+    """Map ASR words to their canon words inside one ayah's text.
+
+    Returns one entry per ASR word: the index of the canon word it recites, or
+    None when the word could not be matched. Used to cut the DISPLAY text of a
+    breath phrase at the exact words being recited instead of by proportional
+    word counts: a reciter who REPEATS a passage makes the word count longer
+    than the canon ayah, so proportional slicing shifts every later phrase's
+    text ahead of the voice (measured on 59:15: caption read "ذاقوا وبال"
+    while the reciter was saying "كمثل الذين من قبلهم").
+
+    Matching is forward-preferring but allows a jump BACK (a repeat), and
+    falls back to a fuzzy window around the expected position for misheard
+    words. Returns None when the ayah text is empty."""
+    canon = text_ar.split()
+    if not canon or not ws:
+        return None
+    lookup: dict[str, list[int]] = {}
+    for i, raw in enumerate(canon):
+        for v in {_normalize(raw), _normalize_std(raw)}:
+            lookup.setdefault(v, []).append(i)
+    # per-index comparable form for the fuzzy fallback
+    uth = [_normalize(w) for w in canon]
+    std = [_normalize_std(w) for w in canon]
+
+    out: list[int | None] = []
+    pos = 0
+    for w in ws:
+        t = _normalize(w.get("text") or "")
+        if not t:
+            out.append(None)
+            continue
+        cands = lookup.get(t)
+        if cands:
+            # nearest canon occurrence; forward wins a tie (normal recitation
+            # advances word by word, a repeat jumps back).
+            j = min(cands, key=lambda c: (abs(c - pos), c < pos))
+            out.append(j)
+            pos = j + 1
+            continue
+        # fuzzy window around where the next word should be
+        lo = max(0, pos - 10)
+        hi = min(len(canon), pos + 10)
+        best, best_score = None, 0.0
+        for j in range(lo, hi):
+            score = max(fuzz.ratio(t, uth[j]), fuzz.ratio(t, std[j]))
+            if score > best_score:
+                best, best_score = j, score
+        if best is not None and best_score >= 78:
+            out.append(best)
+            pos = best + 1
+        else:
+            out.append(None)
+    return out
+
+
 def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None,
-                  raw_segs: list[tuple[float, float]] | None = None) -> list[dict]:
+                  raw_segs: list[tuple[float, float]] | None = None,
+                  canon_pos: list[int | None] | None = None) -> list[dict]:
     """Split one ayah segment into breath-phrase segments at REAL pauses
     (inter-word silences >= SILENCE_SPLIT measured from the audio), so the
     caption vanishes while the reciter breathes and resumes where they resume.
@@ -248,16 +368,20 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
     word gap as weak evidence. Canon text is re-sliced to each phrase by
     word-count proportion (recitation order == text order); English uses the
     same proportional cuts, snapped to the nearest sentence break so
-    translations don't split mid-sentence. raw_segs: raw (unmerged) VAD
-    speech segments — when given (provider path), each phrase's word-derived
-    bounds are VAD-clamped to real speech edges (provider word stamps are
-    ±200-500ms noisy; the local forced-align path skips this because
-    wav2vec2 times are already frame-accurate).
+    translations don't split mid-sentence. canon_pos (provider path) replaces
+    the proportional cut with the exact canon span each phrase recites, so a
+    REPEATED passage cannot shift the text ahead of the voice. raw_segs: raw
+    (unmerged) VAD speech segments — when given (provider path), each
+    phrase's word-derived bounds are VAD-clamped to real speech edges
+    (provider word stamps are ±200-500ms noisy; the local forced-align path
+    skips this because wav2vec2 times are already frame-accurate).
 
     Audio-evidenced cuts are ALWAYS kept — even a 1-word phrase before a real
     breath shows briefly then blanks, and never bridges the pause. Tiny-phrase
     merging applies to the fallback path only (fake whisper gaps must not
-    shatter captions).
+    shatter captions). With raw_segs, a phrase ending in a madd word is HELD
+    past an early provider cut into continuing voicing (_madd_extend) so the
+    caption survives long mujawwad elongations instead of vanishing mid-vowel.
 
     Returns [seg] unchanged when there is no pause to split on."""
     if len(words) < 2:
@@ -282,6 +406,12 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
         if raw_segs:
             s, e = _vad_clamp_bounds(
                 seg["start"], seg["end"], ws[0], ws[-1], raw_segs)
+            # Single-phrase ayah (the common verse-final madd case): hold a
+            # madd tail the provider cut early. verse_final: one region covers
+            # the whole segment, whose text is the full canon ayah here.
+            raw_tail = (seg.get("text_ar") or "").split()
+            e = _madd_extend(e, raw_tail[-1] if raw_tail else "",
+                             True, silence_runs, raw_segs, float("inf"))
             seg = dict(seg, start=s, end=e)
         return [seg]
 
@@ -333,25 +463,79 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
         k = int(seq_len * (hi + 1) / total)
         return max(0, min(seq_len, k))
 
+    # Repeat-proof text spans: cut each phrase's display text at the canon
+    # words it actually recites. A repeated passage makes the ASR word count
+    # exceed the canon word count, so proportional cutting shifts every later
+    # phrase's text ahead of the voice. Only used when EVERY phrase has at
+    # least one recognised word — otherwise proportional stays the safe
+    # default (a misheard phrase must never blank a language).
+    n_regions = len(regions)
+    spans: list[tuple[int, int]] | None = None
+    if canon_pos and len(canon_pos) == total and n_ar:
+        per: list[tuple[int, int]] = []
+        for idx, (lo, hi) in enumerate(regions):
+            got = [p for p in canon_pos[lo:hi + 1] if p is not None]
+            if not got:
+                per = []
+                break
+            m0, m1 = min(got), max(got)
+            if idx == 0 and m0 <= 2:
+                m0 = 0                 # recover a misheard head (not a mid-ayah clip)
+            if idx == n_regions - 1 and (n_ar - 1 - m1) <= 2:
+                m1 = n_ar - 1          # recover a misheard tail (not a repeated ending)
+            per.append((m0, m1 + 1))
+        if per:
+            spans = per
+
     out = []
     prev_b_ar = 0
     prev_b_en = 0
     for idx, (lo, hi) in enumerate(regions):
-        last = idx == len(regions) - 1
-        b_ar = cut(n_ar, hi)
-        b_en_plain = cut(n_en, hi)
-        b_en = b_en_plain if last else _snap_en_boundary(en_words, prev_b_en, b_en_plain)
-        a_ar, a_en = prev_b_ar, prev_b_en
-        # never emit an empty phrase
-        b_ar = max(b_ar, min(a_ar + 1, n_ar)) if b_ar <= a_ar else b_ar
-        b_en = max(b_en, min(a_en + 1, n_en)) if b_en <= a_en else b_en
-        prev_b_ar, prev_b_en = b_ar, b_en
+        last = idx == n_regions - 1
+        if spans is not None:
+            a_ar, b_ar = spans[idx]
+            a_en = (round(a_ar * n_en / n_ar) if n_en else 0)
+            b_en = (round(b_ar * n_en / n_ar) if n_en else 0)
+            if n_en and b_en <= a_en:
+                b_en = min(a_en + 1, n_en)
+            prev_b_ar, prev_b_en = b_ar, b_en
+        else:
+            # Reserve one word per remaining phrase so no phrase is starved:
+            # the proportional cut must never consume words a later phrase
+            # still needs.
+            regions_left = n_regions - idx - 1
+            if last:
+                # Last phrase takes EVERYTHING left in both languages, so the
+                # tail of the ayah can never lose its text (this was the
+                # "English did not show" bug: the final 1-2 Arabic words were
+                # emitted with an empty English slice because the proportional
+                # EN cut had already been consumed by the previous phrase).
+                b_ar, b_en = n_ar, n_en
+            else:
+                b_ar = min(cut(n_ar, hi), n_ar - regions_left)
+                b_en_plain = cut(n_en, hi)
+                b_en = _snap_en_boundary(en_words, prev_b_en, b_en_plain)
+                b_en = min(b_en, n_en - regions_left)
+            a_ar, a_en = prev_b_ar, prev_b_en
+            # Never emit a phrase with a language it still has words for.
+            if n_ar and b_ar <= a_ar:
+                b_ar = min(a_ar + 1, n_ar)
+            if n_en and b_en <= a_en:
+                b_en = min(a_en + 1, n_en)
+            prev_b_ar, prev_b_en = b_ar, b_en
         phrase = dict(seg)
         pstart = round(float(ws[lo]["start"]), 3)
         pend = round(float(ws[hi]["end"]), 3)
         if raw_segs:
             pstart, pend = _vad_clamp_bounds(
                 pstart, pend, ws[lo], ws[hi], raw_segs)
+            # Hold a madd tail the provider cut early (mid-verse cap, bigger
+            # verse-final cap). Capped at the next phrase's start so regions
+            # never overlap here either (apply_sync_padding re-enforces).
+            cap_next = (float(ws[regions[idx + 1][0]]["start"]) - MIN_GAP
+                        if not last else float("inf"))
+            pend = _madd_extend(pend, ar_words[b_ar - 1] if b_ar else "",
+                               last, silence_runs, raw_segs, cap_next)
         phrase.update({
             "start": pstart,
             "end": pend,
@@ -412,9 +596,14 @@ def apply_sync_padding(
     (appears after the voice) and squeezed to a flash/zero-length cue the
     live player can never display (`t < end` is never true).
 
-    Real speech alignment is the job of the ASR path upstream — Groq provider
-    words are VAD-anchored (Silero slice bounds) to within ~50ms of wav2vec2
-    forced alignment; this function only nudges *display* timing."""
+    Every emitted cue is guaranteed DISPLAYABLE (start < end): the live player
+    matches on `t >= start && t < end`, so a zero-length cue is never shown at
+    all. When an upstream phrase has no free room (its start was pushed onto or
+    past its own end because the previous caption's end ran into it), its text
+    is CARRIED FORWARD into the next caption that does show, instead of being
+    emitted as an invisible stub — no recited moment is ever left uncaptioned.
+    Real speech alignment is the job of the ASR path upstream; this function
+    only nudges *display* timing."""
     segs = sorted(segments, key=lambda s: s["start"])
     runs = sorted(silence_runs) if silence_runs else []
 
@@ -434,11 +623,25 @@ def apply_sync_padding(
     pushed_start = [
         push_start(max(0.0, round(seg["start"] - LEAD_IN, 3))) for seg in segs
     ]
-    for i, seg in enumerate(segs):
-        seg["start"] = pushed_start[i]
+
+    out: list[dict] = []
     prev_end = 0.0
+    # Text of phrases that had no displayable room, carried forward into the
+    # next cue that does show. Order-preserving: no recited text is lost.
+    carry_ar: list[str] = []
+    carry_en: list[str] = []
+
+    def absorb(target: dict, src: dict) -> dict:
+        merged = dict(target)
+        for key in ("text_ar", "text_en"):
+            a = (merged.get(key) or "").strip()
+            b = (src.get(key) or "").strip()
+            if b and b not in a:
+                merged[key] = (a + " " + b).strip() if a else b
+        return merged
+
     for i, seg in enumerate(segs):
-        seg["start"] = max(round(prev_end + MIN_GAP, 3), seg["start"])
+        start = max(round(prev_end + MIN_GAP, 3), pushed_start[i])
         # Next caption's onset is sacred: nothing here may cover it. The next
         # pushed start only ever moves forward (prev_end clamp above), so
         # capping at it can leave a wider gap but never an overlap.
@@ -447,10 +650,27 @@ def apply_sync_padding(
         end = pull_end(min(round(raw_end[i] + LEAD_OUT, 3), ncap))
         end = max(end,
                   pull_end(min(round(raw_end[i], 3), ncap)),
-                  pull_end(min(round(seg["start"] + MIN_DUR, 3), ncap)))
-        seg["end"] = max(end, seg["start"])
-        prev_end = seg["end"]
-    return segs
+                  pull_end(min(round(start + MIN_DUR, 3), ncap)))
+        if end <= start and i + 1 < len(segs):
+            # No displayable room: this cue would be zero-length and thus
+            # invisible forever (`t < end` never true). Carry its text into
+            # the NEXT cue that shows instead of emitting a stub.
+            carry_ar.append(seg.get("text_ar") or "")
+            carry_en.append(seg.get("text_en") or "")
+            continue
+        if end <= start:
+            # Last phrase with no room: keep a minimal displayable span so the
+            # final words still appear (nothing follows to absorb them).
+            end = round(start + max(MIN_DUR, 0.12), 3)
+        if carry_ar or carry_en:
+            seg = absorb(seg, {"text_ar": " ".join(carry_ar),
+                               "text_en": " ".join(carry_en)})
+            carry_ar, carry_en = [], []
+        seg["start"] = start
+        seg["end"] = end
+        out.append(seg)
+        prev_end = end
+    return out
 
 
 def build_segments(
@@ -743,14 +963,19 @@ def segments_from_provider_times(
         if not chain:
             continue
         words_by_ayah: dict[tuple[int, int], list[dict]] = {}
+        used_idx: set[int] = set()
         for word_idx, surah, ayah in chain:
             if not (0 <= word_idx < len(words)):
                 continue
             words_by_ayah.setdefault((surah, ayah), []).append(words[word_idx])
+            used_idx.add(word_idx)
 
-        for (surah, ayah), ws in sorted(
+        ordered = sorted(
             words_by_ayah.items(), key=lambda kv: float(kv[1][0]["start"])
-        ):
+        )
+        _close_chain_holes(ordered, words, used_idx, texts_ar)
+
+        for (surah, ayah), ws in ordered:
             start = min(float(w.get("start", 0.0)) for w in ws)
             end = max(float(w.get("end", start)) for w in ws)
             seg = {
@@ -764,13 +989,165 @@ def segments_from_provider_times(
             segments.append(seg)
             all_word_groups.append((seg, sorted(ws, key=lambda w: float(w["start"]))))
 
-    segments = [p for seg, ws in all_word_groups
-                for p in _phrase_split(seg, ws, silence_runs, raw_segs)]
+    segments = []
+    for seg, ws in all_word_groups:
+        cpos = _map_words_to_canon(ws, seg.get("text_ar") or "")
+        segments.extend(_phrase_split(seg, ws, silence_runs, raw_segs, cpos))
     segments.sort(key=lambda s: s["start"])
+    _close_wordless_holes(segments, raw_segs, silence_runs)
     return apply_sync_padding(
         inject_opener_segments(matches, words, segments, silence_runs, raw_segs),
         silence_runs,
     )
+
+
+def _close_chain_holes(ordered, words, used_idx: set[int], texts_ar) -> None:
+    """Give every recited word a caption by closing the detector's holes.
+
+    The detector's chain is sparse: a word the ASR misheard, or a passage
+    the reciter REPEATED, is left out of it. Those words are still in the
+    transcript with correct timestamps, but no segment covered them — so
+    the screen went blank for those seconds while the reciter was plainly
+    still reciting (measured: 19 s of an 8-minute recitation).
+
+    For every hole between two consecutive ayah groups, the unmatched words
+    are assigned to the ayah whose canon text they match best — a repeated
+    passage belongs to the repeated ayah, so its caption simply extends
+    over the repeat. When nothing matches (a genuinely misheard tail) they
+    go to the preceding ayah, whose caption then covers its own tail. Either
+    way no recited second is left uncaptioned.
+
+    Words are also filled INSIDE a group's own time span: the chain skips a
+    word mid-ayah (misheard) while its neighbours on both sides are chained,
+    so it is not in any "hole between groups" yet its seconds are voiced.
+    Measured on 59:2: "يحتسموا" (49.887-51.347) was skipped this way and left
+    1.42 s of blank screen — the old wordless-gap bridge hid it by accident.
+    """
+    n = len(words)
+    if not n:
+        return
+
+    # (a) chain-skipped words that sit INSIDE a group's span belong to it
+    for _key, ws in ordered:
+        if not ws:
+            continue
+        lo = min(float(w.get("start", 0.0)) for w in ws)
+        hi = max(float(w.get("end", 0.0)) for w in ws)
+        for j in range(n):
+            if j in used_idx:
+                continue
+            w = words[j]
+            if (lo - 0.05 <= float(w.get("start", 0.0))
+                    and float(w.get("end", 0.0)) <= hi + 0.05):
+                used_idx.add(j)
+                ws.append(w)
+        ws.sort(key=lambda w: float(w.get("start", 0.0)))
+
+    if len(ordered) < 2:
+        return
+
+    def canon_words(surah: int, ayah: int) -> set[str]:
+        txt = texts_ar.get(f"{surah}:{ayah}", "")
+        return {_normalize(w) for w in txt.split() if w}
+
+    for i in range(len(ordered) - 1):
+        (key_a, ws_a), (key_b, ws_b) = ordered[i], ordered[i + 1]
+        end_a = max(float(w.get("end", 0.0)) for w in ws_a)
+        start_b = min(float(w.get("start", 0.0)) for w in ws_b)
+        if start_b - end_a <= 0.05:
+            continue
+        # the unmatched transcript words inside the hole
+        hole = []
+        for j in range(n):
+            if j in used_idx:
+                continue
+            w = words[j]
+            if end_a - 0.05 <= float(w.get("start", 0.0)) < start_b + 0.05:
+                hole.append((j, w))
+        if not hole:
+            continue
+        hole_norms = [_normalize(w["text"]) for _, w in hole if w.get("text")]
+        if not hole_norms:
+            continue
+        # best-matching neighbour ayah
+        best_key, best_score = None, 0.0
+        for key in (key_b, key_a):
+            cw = canon_words(*key)
+            if not cw:
+                continue
+            hit = sum(1 for h in hole_norms if h in cw)
+            score = hit / len(hole_norms)
+            if score > best_score:
+                best_key, best_score = key, score
+        if best_key is None or best_score < 0.5:
+            best_key = key_a  # unmatched tail -> the preceding ayah
+        ordered_group = ws_a if best_key == key_a else ws_b
+        for j, w in hole:
+            used_idx.add(j)
+            ordered_group.append(w)
+        ordered_group.sort(key=lambda w: float(w.get("start", 0.0)))
+
+
+def _close_wordless_holes(segments: list[dict], raw_segs,
+                          silence_runs: list | None = None) -> None:
+    """Keep the caption on across a stretch the ASR gave no words for.
+
+    Some stretches produce no provider word at all (the ASR swallowed them
+    into a neighbouring word's time range). If the VAD says the reciter was
+    SPEAKING there, the caption must not go blank in the middle of his
+    recitation — the gap is bridged. Where the VAD says silence, the gap is
+    a real breath and the caption correctly disappears.
+
+    A gap can contain BOTH: a breath, then voiced-but-wordless recitation
+    (madd-held phrase, repeated passage the ASR dropped). Bridging the whole
+    gap used to paint the caption straight across the breath (measured: two
+    >=0.4s pauses held on the 8-min Al-Hashr clip). Now each VOICED island
+    inside the gap gets a caption of its own — same text as the phrase before
+    it, which is what the reciter is still saying — and the breath stays
+    blank.
+
+    silence_runs: audio-truth pauses (backend.vad.silence_runs). When omitted
+    they are derived from raw_segs, keeping the legacy call shape.
+    """
+    if not raw_segs or len(segments) < 2:
+        return
+    if silence_runs is None:
+        silence_runs = []
+        for (_, e1), (s2, _) in zip(raw_segs, raw_segs[1:]):
+            if s2 - e1 >= BREATH_MIN:
+                silence_runs.append((e1, s2))
+    silences = sorted((float(s), float(e)) for s, e in silence_runs
+                      if float(e) - float(s) >= BREATH_MIN)
+    out: list[dict] = []
+    for idx, a in enumerate(segments):
+        out.append(a)
+        if idx + 1 >= len(segments):
+            break
+        b = segments[idx + 1]
+        if b["start"] - a["end"] <= 0.10:
+            continue
+        # breaths that touch this gap (start sorted)
+        inner = [(s, e) for s, e in silences
+                 if s < b["start"] - 0.02 and e > a["end"] + 0.02]
+        if not inner:
+            # continuous voicing: nothing to blank, hold the caption through
+            a["end"] = round(b["start"] - 0.001, 3)
+            continue
+        # stop the caption at the first breath it runs into — and hold it
+        # through any voiced-but-wordless stretch before that breath ...
+        first_start = inner[0][0]
+        if first_start > a["start"] + 0.02:
+            a["end"] = round(first_start, 3)
+        # ... then re-show it over every voiced island after a breath
+        for k, (_, re) in enumerate(inner):
+            island_start = max(re, a["end"])
+            island_end = (inner[k + 1][0] if k + 1 < len(inner)
+                          else b["start"])
+            if island_end - island_start <= 0.10:
+                continue
+            out.append(dict(a, start=round(island_start, 3),
+                            end=round(island_end - 0.001, 3)))
+    segments[:] = out
 
 
 def build_srt(segments: list[dict], language: str = "ar") -> str:

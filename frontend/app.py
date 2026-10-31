@@ -1,12 +1,21 @@
 ﻿import base64
 import json
 import os
+import sys
 import time
 import uuid
 
 import pandas as pd
 import requests
 import streamlit as st
+
+# Sibling modules are imported by directory (not as a package): the app runs
+# as `streamlit run frontend/app.py` both here and on the Space, so the
+# script dir is the only stable anchor.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from sync_inspector import inspector_html as sync_inspector_html  # noqa: E402
 
 API_URL = os.environ.get("QCAP_API_URL", "http://localhost:8000")
 PUBLIC_URL = os.environ.get("QCAP_PUBLIC_URL", API_URL)
@@ -544,7 +553,7 @@ if (!window.__qcap) {{
     return w;
   }}
 
-  // The <video> uses object-fit:contain, so a source whose aspect differs
+  // The video element uses object-fit:contain, so a source whose aspect differs
   // from the 16:9 player box is LETTERBOXED: the picture occupies only the
   // middle of the element and the rest is black bar. A caption sized to the
   // ELEMENT therefore runs out over the bars and gets clipped by the frame.
@@ -788,6 +797,46 @@ if (wrap) {{
 """
 
 
+def sync_payload(segments: list[dict], words: list[dict]) -> dict | None:
+    """Fetch (and cache) the audio-vs-caption audit for the current media.
+
+    Cached on a signature of the caption timing, so a style/language rerun is
+    free and a timing edit refetches. The audio half of the analysis is
+    cached server-side per media file, so an edit is cheap there too.
+    """
+    mid = ss.get("media_id")
+    if not mid or not segments:
+        return None
+    sig = (mid, len(segments),
+           round(sum(float(s["start"]) for s in segments), 2),
+           round(sum(float(s["end"]) for s in segments), 2),
+           len(words or []))
+    if ss.get("sync_sig") == sig and ss.get("sync_payload"):
+        return ss["sync_payload"]
+    with st.spinner("Reading the audio (first time for this clip takes a moment)…"):
+        try:
+            resp = requests.post(
+                f"{API_URL}/media/{mid}/sync",
+                json={"segments": segments, "words": words or [],
+                      "max_points": 20000},
+                timeout=1800,
+            )
+        except Exception as e:
+            st.warning(f"Sync inspector unavailable: {e}")
+            return None
+    if resp.status_code != 200:
+        st.warning(f"Sync inspector unavailable: {api_error(resp)}")
+        return None
+    try:
+        pay = resp.json()
+    except Exception as e:
+        st.warning(f"Sync inspector unavailable: {e}")
+        return None
+    ss["sync_sig"] = sig
+    ss["sync_payload"] = pay
+    return pay
+
+
 def media_bytes():
     """File bytes for a (re-)upload to /media.
 
@@ -937,6 +986,9 @@ if uploaded is not None:
         ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
         ss["align_result"] = None
         ss["segments"] = None
+        ss["sync_live"] = False
+        ss["sync_payload"] = None
+        ss["sync_sig"] = None
         ss["lang"] = "ar"
         ss["render_job_id"] = None
         ss["media_id"] = uuid.uuid4().hex[:10]
@@ -1049,6 +1101,10 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                 st.stop()
             ss["align_result"] = data
             ss["segments"] = [dict(s) for s in data["segments"]]
+            # A new align means new evidence: drop the old inspector payload.
+            ss["sync_live"] = False
+            ss["sync_payload"] = None
+            ss["sync_sig"] = None
             prog.progress(100, text="Done · captions ready")
             status.update(label="Surah detected!", state="complete")
 
@@ -1115,6 +1171,40 @@ if ss["align_result"] is not None and ss["segments"]:
             ),
             unsafe_allow_javascript=True,
         )
+
+    with st.expander(
+        "🔍 Sync inspector — see the audio your captions were timed against",
+        expanded=False,
+    ):
+        st.caption(
+            "One timeline: waveform · Silero speech (green) and measured breaths "
+            "(amber) · caption blocks · ASR word ticks. Wheel = zoom, drag = pan, "
+            "click = jump the player there. Red = a real defect, amber = a boundary "
+            "worth eyeballing."
+        )
+        _words = (ss.get("align_result") or {}).get("words") or []
+        # Reading an hour of audio costs the host real time, so nothing runs
+        # until asked for. Once built it stays live across reruns (the server
+        # caches the audio half, the session caches the whole payload).
+        if st.button("📈 Build the sync chart", key="sync_build"):
+            ss["sync_live"] = True
+        st.caption(
+            "The chart is built on demand so an align never waits on it. "
+            "Press the button once; caption edits afterwards refresh it "
+            "automatically (the audio analysis itself is cached)."
+        )
+
+    # The chart itself lives OUTSIDE the expander: clicking Build reruns the
+    # app, and Streamlit re-renders an expander collapsed (its `expanded` flag
+    # only applies when the element first mounts), so a chart inside would be
+    # hidden the moment it finished building.
+    if ss.get("sync_live"):
+        _pay = sync_payload(ss["segments"], _words)
+        if _pay:
+            st.html(
+                sync_inspector_html(_pay, ss["segments"]),
+                unsafe_allow_javascript=True,
+            )
 
     # ---------------------------------------------------------------- Burn-in & download
     st.markdown("#### Burn-in & download — renders the final MP4 once you like the look")

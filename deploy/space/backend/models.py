@@ -54,6 +54,10 @@ class AlignResponse(BaseModel):
     srt: str
     vtt: str
     matches: list[MatchInfo] = []
+    # Which speech detector produced the pause data the captions were cut
+    # on: 'torch' | 'onnx' | 'energy'. The energy fallback finds different
+    # pauses than Silero, so this is reported rather than hidden.
+    vad_backend: str = "unknown"
 
 
 class RenderRequest(BaseModel):
@@ -71,3 +75,16 @@ class RenderResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: str
+
+
+class SyncRequest(BaseModel):
+    """Captions to audit against the media file's own audio.
+
+    The captions are sent by the client (not read from a stored align
+    result) so the inspector reflects hand-edited timings too.
+    """
+    segments: list[Segment] = []
+    words: list[WordTimestamp] = []
+    # Upper bound on the number of timeline columns. Peaks/probs are
+    # max-pooled to this, which is what keeps a 2h clip's payload small.
+    max_points: int = 20000

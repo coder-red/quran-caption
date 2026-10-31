@@ -17,11 +17,13 @@ from backend.models import (
     ChunkTimestamp,
     Segment,
     ErrorResponse,
+    SyncRequest,
 )
 from backend.aligner import ASREngine
 from backend.detector import SurahDetector
 from backend.renderer import render_captions, render_preview, DEFAULT_STYLES
 from backend.config import TEMP_DIR, CONFIDENCE_THRESHOLD, FFMPEG_PATH
+from backend.audio_util import ensure_16k_mono
 
 # Caption-level match gate (lower than CONFIDENCE_THRESHOLD): disjoint rough
 # matches (e.g. a slightly misheard Fatihah opening at 0.84) are real and
@@ -222,6 +224,12 @@ def _align_impl(
         # silence). Derived from the unmerged VAD segments — one pass, both
         # silence data and speech region used.
         raw_segs = get_speech_segments(audio_full, sr_full)
+        try:
+            # Reused by POST /media/{id}/sync so the inspector does not pay
+            # for a second VAD pass over the same file.
+            _VAD_RUNS_CACHE[_cache_key(media_path or audio_path)] = list(raw_segs)
+        except Exception:
+            pass
         sil_runs = silence_runs_from_segments(raw_segs)
         segs = merge_segments(raw_segs)
         if not segs:
@@ -779,6 +787,83 @@ def media_preview(media_id: str):
         if r is None or r.returncode != 0 or not os.path.exists(out):
             return FileResponse(path, media_type="video/mp4")
     return FileResponse(out, media_type="video/mp4")
+
+
+# ---------------------------------------------------------------- sync audit
+# The sync inspector draws the audio evidence the captions were timed
+# against. Both halves are cached: the VAD runs an /align already measured
+# are reused (so opening the inspector right after aligning is instant), and
+# the computed layers are cached per (media, mtime, resolution).
+_VAD_RUNS_CACHE: dict[tuple[str, float], list] = {}
+_SYNC_LAYERS_CACHE: dict[tuple, dict] = {}
+_SYNC_CACHE_LOCK = threading.Lock()
+_SYNC_CACHE_MAX = 8
+
+
+def _cache_key(path: str) -> tuple[str, float]:
+    try:
+        return (os.path.abspath(path), round(os.path.getmtime(path), 3))
+    except OSError:
+        return (os.path.abspath(path), 0.0)
+
+
+def _sync_layers_for(media_id: str, max_points: int) -> dict:
+    path = MEDIA_FILES.get(media_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Media not found")
+    key = (_cache_key(path), int(max_points))
+    with _SYNC_CACHE_LOCK:
+        hit = _SYNC_LAYERS_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    import soundfile as sf
+    from backend.sync_audit import audio_layers
+
+    wav, owned = ensure_16k_mono(path)
+    try:
+        audio, sr = sf.read(wav, dtype="float32")
+        if getattr(audio, "ndim", 1) > 1:
+            audio = audio.mean(axis=1)
+        with _SYNC_CACHE_LOCK:
+            runs = _VAD_RUNS_CACHE.get(_cache_key(path))
+        layers = audio_layers(audio, sr, max_points=int(max_points),
+                              speech_runs=runs)
+    finally:
+        if owned:
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+
+    with _SYNC_CACHE_LOCK:
+        if len(_SYNC_LAYERS_CACHE) >= _SYNC_CACHE_MAX:
+            _SYNC_LAYERS_CACHE.clear()
+        _SYNC_LAYERS_CACHE[key] = layers
+    return layers
+
+
+@app.post("/media/{media_id}/sync")
+def media_sync(media_id: str, req: SyncRequest):
+    """Audit captions against the media's own audio (sync inspector data).
+
+    Returns peaks, the Silero probability curve, measured speech/silence
+    runs, word stamps and a list of concrete defects. Window-agnostic: the
+    browser zooms client-side, so one payload serves every zoom level.
+    """
+    from backend.sync_audit import analyze
+
+    max_points = max(2000, min(int(req.max_points or 20000), 40000))
+    try:
+        layers = _sync_layers_for(media_id, max_points)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"audio analysis failed: {e}")
+    return analyze(None, 16000,
+                   [s.model_dump() for s in req.segments],
+                   [w.model_dump() for w in req.words],
+                   layers=layers)
 
 
 RENDER_JOBS: dict[str, dict] = {}
