@@ -408,8 +408,10 @@ _FAST_UPLOAD_JS = """
       try { picker.remove(); } catch (e) {}
       if (!f) { return; }
       setStatus('Extracting audio…');
-      var fmt = window.__qcapProxyFormat || 'ogg_opus';
-      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000, format: fmt })
+      // NOT named `fmt` — that would shadow the fmt() byte formatter below,
+      // and the status call would throw after the proxy was already built.
+      var proxyFormat = window.__qcapProxyFormat || 'ogg_opus';
+      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000, format: proxyFormat })
         .then(function (out) {
           var base = (f.name || 'clip').replace(/\\.[^.]+$/, '');
           // File.name is read-only — assigning to it silently does nothing.
