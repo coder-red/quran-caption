@@ -195,21 +195,6 @@ div[data-testid="stHtml"] #capwrap { box-shadow: 0 8px 32px rgba(0,0,0,0.55); }
 /* Data editor: allow horizontal scroll on narrow screens */
 div[data-testid="stDataFrame"] { overflow-x: auto; }
 
-/* Fast upload (browser-side audio proxy) */
-.qcap-fast { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;
-             margin: 0.35rem 0 0.6rem; }
-#qcap-fast-btn {
-  background: linear-gradient(135deg, #10b981, #059669);
-  color: #04110c; border: none; border-radius: 9px; padding: 0.5rem 0.9rem;
-  font-weight: 700; font-size: 0.9rem; cursor: pointer;
-  box-shadow: 0 2px 10px rgba(16, 185, 129, 0.25);
-}
-#qcap-fast-btn:hover { filter: brightness(1.08); }
-#qcap-fast-btn:disabled { opacity: 0.6; cursor: progress; }
-.qcap-fast-hint { font-size: 0.8rem; color: #8b93a7; flex: 1 1 260px; }
-.qcap-fast-status { font-size: 0.82rem; color: #34d399; margin: 0.15rem 0 0.4rem; }
-.qcap-fast-status.bad { color: #f87171; }
-
 @media (max-width: 768px) {
   .block-container { padding: 0.8rem 0.8rem 2rem; }
   .hero { padding: 0.6rem 0 0.2rem; }
@@ -236,7 +221,7 @@ div[data-testid="stDataFrame"] { overflow-x: auto; }
 st.markdown("""
 <div class="hero">
   <h1>📖 Quran Caption</h1>
-  <p>Upload a recitation — we detect the surah, sync every ayah to the audio, and let you fine-tune timing, text, language, and style before rendering.</p>
+  <p>Upload a video — Quran captions, synced ayah by ayah.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -291,30 +276,12 @@ ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
-# media_id of the ORIGINAL video, uploaded separately at the burn-in step
-# when the align ran on a browser-made audio proxy.
+# media_id of the video, uploaded separately at the burn-in step when the
+# recitation itself was an audio file (captions still need something to burn
+# into).
 ss.setdefault("video_media_id", None)
 ss.setdefault("video_uploaded", False)
 ss.setdefault("video_meta", None)
-
-
-def proxy_formats() -> list[str] | None:
-    """Which fast-upload proxy formats the caption engine can decode.
-
-    The engine probes its OWN ffmpeg (it may be imageio-ffmpeg's binary or
-    a system build, and not every build has an Opus decoder). Asking the
-    engine — rather than assuming — means the browser never sends a format
-    the server will fail to decode. Returns None when the engine is not
-    reachable yet (the caller retries later)."""
-    try:
-        r = requests.get(f"{API_URL}/health", timeout=20)
-        if r.status_code == 200:
-            fmts = r.json().get("proxy_formats")
-            if isinstance(fmts, list) and fmts:
-                return [f for f in fmts if f in ("ogg_opus", "wav")]
-    except (requests.RequestException, ValueError):
-        pass
-    return None
 
 
 def api_error(resp: requests.Response):
@@ -325,143 +292,6 @@ def api_error(resp: requests.Response):
         return str(detail)
     except Exception:
         return resp.text[:400]
-
-
-# ------------------------------------------------------- fast upload (proxy)
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _read_asset(name: str) -> str:
-    try:
-        with open(os.path.join(_APP_DIR, name), "r", encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
-# The browser-side audio proxy encoder. Kept in its own file so it can be
-# linted/tested on its own; inlined here because the page has no route to
-# serve a local asset reliably on every host.
-_PROXY_JS = _read_asset("opus_proxy.js")
-
-# NOTE: a plain string, never an f-string — the JS below is full of braces.
-_FAST_UPLOAD_JS = """
-(function () {
-  if (window.__qcapFastBound) { return; }
-  window.__qcapFastBound = true;
-
-  function statusEl() {
-    var el = document.getElementById('qcap-fast-status');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'qcap-fast-status';
-      el.className = 'qcap-fast-status';
-      document.body.appendChild(el);
-    }
-    return el;
-  }
-  function setStatus(msg, bad) {
-    var el = statusEl();
-    el.textContent = msg || '';
-    el.className = 'qcap-fast-status' + (bad ? ' bad' : '');
-  }
-  window.__qcapFastStatus = setStatus;
-
-  function fmt(n) {
-    if (n > 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
-    return Math.round(n / 1024) + ' KB';
-  }
-
-  function injectFile(file) {
-    var input = document.querySelector('input[data-testid="stFileUploaderDropzoneInput"]')
-             || document.querySelector('input[type=file]');
-    if (!input) {
-      setStatus('Could not find the upload field — reload the page.', true);
-      return;
-    }
-    try {
-      var dt = new DataTransfer();
-      dt.items.add(file);
-      input.files = dt.files;
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    } catch (e) {
-      setStatus('Could not hand the file to the uploader: ' + e, true);
-    }
-  }
-
-  document.addEventListener('click', function (ev) {
-    var btn = ev.target && ev.target.closest ? ev.target.closest('#qcap-fast-btn') : null;
-    if (!btn) { return; }
-    ev.preventDefault();
-
-    if (!window.QcapProxy) {
-      setStatus('This browser cannot build the audio proxy — use the normal upload.', true);
-      return;
-    }
-    var picker = document.createElement('input');
-    picker.type = 'file';
-    picker.accept = 'video/*,audio/*';
-    picker.style.display = 'none';
-    document.body.appendChild(picker);
-    picker.addEventListener('change', function () {
-      var f = picker.files && picker.files[0];
-      try { picker.remove(); } catch (e) {}
-      if (!f) { return; }
-      setStatus('Extracting audio…');
-      // NOT named `fmt` — that would shadow the fmt() byte formatter below,
-      // and the status call would throw after the proxy was already built.
-      var proxyFormat = window.__qcapProxyFormat || 'ogg_opus';
-      window.QcapProxy.buildAudioProxy(f, { bitrate: 24000, format: proxyFormat })
-        .then(function (out) {
-          var base = (f.name || 'clip').replace(/\\.[^.]+$/, '');
-          // File.name is read-only — assigning to it silently does nothing.
-          // Build a NEW File with the wanted name (the "_audio" marker tells
-          // the burn-in step that this media has no video in it).
-          var proxyName = base + (out.format === 'wav' ? '_audio.wav' : '_audio.ogg');
-          var proxy = new File([out.file], proxyName, { type: out.file.type });
-          window.__qcapOriginalFile = f;
-          setStatus('Audio proxy ready: ' + fmt(out.bytes) + ' (was ' +
-                    fmt(out.originalBytes) + ', ' +
-                    Math.round((1 - out.ratio) * 100) + '% smaller). Uploading…');
-          injectFile(proxy);
-        })
-        .catch(function (e) {
-          setStatus('Could not build the audio proxy (' + (e && e.message || e) +
-                    ') — use the normal upload instead.', true);
-        });
-    });
-    picker.click();
-  });
-})();
-"""
-
-FAST_UPLOAD_HTML = (
-    '<div class="qcap-fast">'
-    '<button id="qcap-fast-btn" type="button">'
-    '&#9889; Instant upload (audio only, ~20x smaller)'
-    '</button>'
-    '<span class="qcap-fast-hint">Extracts the audio in your browser and uploads a '
-    'tiny proxy &mdash; captions in seconds instead of minutes. The burned-in MP4 '
-    'still needs the original video (asked for at the end).</span>'
-    '</div>'
-    '<script>' + _PROXY_JS + _FAST_UPLOAD_JS + '</script>'
-)
-
-# Which proxy format the browser should build. The engine knows whether its
-# ffmpeg can decode Ogg/Opus (not every build can), so ask it once and cache.
-_PROXY_FORMAT: str | None = None
-
-
-def proxy_format() -> str:
-    """'ogg_opus' when the engine can decode it, else 'wav' (PCM, universal)."""
-    global _PROXY_FORMAT
-    if _PROXY_FORMAT is None:
-        fmts = proxy_formats()
-        if fmts is None:
-            # Engine not reachable yet — do not cache a guess.
-            return "ogg_opus"
-        _PROXY_FORMAT = "ogg_opus" if "ogg_opus" in fmts else "wav"
-    return _PROXY_FORMAT
 
 
 def fmt_ts(seconds: float) -> str:
@@ -953,27 +783,12 @@ def show_detection(result: dict):
 # ---------------------------------------------------------------- Step 1: upload
 st.markdown('<div class="card"><h3><span class="step-badge">1</span> Upload recitation</h3></div>', unsafe_allow_html=True)
 
-# --- Fast upload (browser-side audio proxy) ---------------------------------
-# A 8-minute recitation video is ~40 MB and the captioning step only ever
-# needs the AUDIO. The browser can extract the audio and encode it to Opus
-# (~3 KB/s) itself, so the upload drops from ~40 MB to ~1.5 MB — the align
-# then starts in seconds instead of minutes on a slow link. The burned-in MP4
-# still needs the original video, so that is offered separately at the end.
-st.html(
-    FAST_UPLOAD_HTML.replace(
-        "</script>",
-        "window.__qcapProxyFormat = " + json.dumps(proxy_format()) + ";</script>",
-    ),
-    unsafe_allow_javascript=True,
-)
-
 uploaded = st.file_uploader(
-    "Choose a video or audio file",
+    "Choose a video — or an audio file",
     type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a", "ogg"],
     label_visibility="collapsed",
     key="file_uploader",
 )
-st.caption(f"Big files upload slowly here (free tier, US server) — trim to the passage you want captioned. Max {MAX_SIZE // (1024 * 1024)}MB.")
 if uploaded is not None:
     if uploaded.size > MAX_SIZE:
         st.error(f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — trim long recordings before uploading on mobile.")
@@ -1118,8 +933,7 @@ if ss["align_result"] is not None and ss["segments"]:
     ensure_media()
 
     st.markdown('<div class="card"><h3><span class="step-badge">2</span> Sync & preview</h3></div>', unsafe_allow_html=True)
-    st.caption("Press play — captions follow the audio. Adjust language, style, and ayah timing below; everything updates live.")
-    st.caption("⚠️ This is a **live overlay preview** of your original file — captions are NOT saved into it. Use **“Render MP4 with captions”** below to get a video with captions permanently burned in.")
+    st.caption("Overlay preview — captions are saved only in the rendered MP4 below.")
 
     # Full-width stacked controls: the old 3-column row ([2,1,2] with an
     # empty spacer) squeezed to unreadable widths on phones. One control
@@ -1174,27 +988,15 @@ if ss["align_result"] is not None and ss["segments"]:
             unsafe_allow_javascript=True,
         )
 
-    with st.expander(
-        "🔍 Sync inspector — see the audio your captions were timed against",
-        expanded=False,
-    ):
+    with st.expander("🔍 Sync inspector", expanded=False):
         st.caption(
-            "One timeline: waveform · Silero speech (green) and measured breaths "
-            "(amber) · caption blocks · ASR word ticks. Wheel = zoom, drag = pan, "
-            "click = jump the player there. Red = a real defect, amber = a boundary "
-            "worth eyeballing."
+            "Waveform, speech and captions on one timeline. "
+            "Wheel = zoom, drag = pan, click = seek."
         )
         _words = (ss.get("align_result") or {}).get("words") or []
-        # Reading an hour of audio costs the host real time, so nothing runs
-        # until asked for. Once built it stays live across reruns (the server
-        # caches the audio half, the session caches the whole payload).
+        # Building the chart reads the whole audio, so it only runs on demand.
         if st.button("📈 Build the sync chart", key="sync_build"):
             ss["sync_live"] = True
-        st.caption(
-            "The chart is built on demand so an align never waits on it. "
-            "Press the button once; caption edits afterwards refresh it "
-            "automatically (the audio analysis itself is cached)."
-        )
 
     # The chart itself lives OUTSIDE the expander: clicking Build reruns the
     # app, and Streamlit re-renders an expander collapsed (its `expanded` flag
@@ -1209,26 +1011,23 @@ if ss["align_result"] is not None and ss["segments"]:
             )
 
     # ---------------------------------------------------------------- Burn-in & download
-    st.markdown("#### Burn-in & download — renders the final MP4 once you like the look")
-    st.caption("This is the **only** step that produces a video with captions saved inside it (burned into every frame). The preview above is a live overlay only.")
+    st.markdown("#### Burn-in & download")
     srt_content = srt_from_segments(ss["segments"], ss["lang"])
     res_label = st.selectbox("Output resolution", list(RESOLUTIONS.keys()), index=0)
     res_w, res_h = RESOLUTIONS[res_label]
 
-    # When the align ran on a browser-made audio proxy there is no video on
-    # the server, so the burn-in needs the original file uploaded here.
-    # The proxy is named "<original>_audio.ogg" / "<original>_audio.wav".
-    _media_name = (ss.get("file_meta") or {}).get("name", "")
-    _audio_only = "_audio." in _media_name.lower()
+    # An audio upload has no picture to burn the captions into, so the
+    # matching video is asked for here (once, at render time).
+    _meta = ss.get("file_meta") or {}
+    _name = (_meta.get("name") or "").lower()
+    _audio_only = (_meta.get("type") or "").startswith("audio/") or _name.endswith(
+        (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
+    )
     if _audio_only:
-        st.info(
-            "The captions were made from an **audio-only** proxy (the fast upload). "
-            "To burn them into a video, add the original file here — this is the "
-            "one step that needs the full-size upload."
-        )
+        st.info("This recitation is audio only — add the matching video to burn the captions into it.")
         _vfile = st.file_uploader(
-            "Original video (for the burned-in MP4)",
-            type=["mp4", "webm", "mov", "avi", "mkv", "m4a", "mp3", "wav"],
+            "Video for the burned-in MP4",
+            type=["mp4", "webm", "mov", "avi", "mkv"],
             label_visibility="collapsed",
             key="video_uploader",
         )
@@ -1253,11 +1052,7 @@ if ss["align_result"] is not None and ss["segments"]:
             else:
                 st.success("Original video uploaded — ready to render.")
         if not ss.get("video_uploaded"):
-            st.warning(
-                "No original video yet — rendering now would produce an "
-                "**audio-only** MP4 with the captions burned in. Add the "
-                "video above for a proper video with captions."
-            )
+            st.warning("Without a video, the render is audio only.")
 
     render_clicked = st.button("Render MP4 with captions", type="primary", use_container_width=True)
     if render_clicked:
@@ -1321,7 +1116,7 @@ if ss["align_result"] is not None and ss["segments"]:
             prog.progress(min(100, int(job["progress"])),
                           text=f"{job['status'].title()} · {job['progress']:.0f}%"
                                + (f" · {job['encoder']}" if job.get("encoder") else ""))
-            st.caption("This runs in the background — the page will refresh automatically. Close this tab anytime; the render continues.")
+            st.caption("Rendering in the background — you can close this tab.")
 
             if job["status"] == "error":
                 st.error(f"Render failed: {job['error']}")
@@ -1332,7 +1127,6 @@ if ss["align_result"] is not None and ss["segments"]:
                     if r.status_code == 200:
                         st.success("Video rendered.")
                         st.video(r.content)
-                        st.caption("The player above is the **burned-in** result — captions are permanently in this MP4.")
                         st.download_button(
                             "Download MP4", data=r.content,
                             file_name=f"quran_captions_{ss['render_job_id']}.mp4",
