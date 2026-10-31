@@ -1,3 +1,4 @@
+from bisect import bisect_left, bisect_right
 from collections import Counter
 
 from rapidfuzz import fuzz
@@ -93,6 +94,18 @@ OPENERS: list[tuple[str, list[str], str, str]] = [
 ]
 
 BISMILLAH_AYAH = "1:1"
+
+# Word-tracked cues. An ayah caption that sits still while the reciter reads
+# through it (measured on the 8-min Al-Hashr clip: median cue 10.2s, longest
+# 29.2s) is what makes a frame-accurate caption still FEEL out of sync — the
+# text on screen has words in it the voice has not reached yet. Each phrase is
+# therefore cut into short cues at the provider's own word timestamps: at most
+# WORD_CUE_WORDS canon words, or at a WORD_CUE_GAP articulation break,
+# whichever comes first. Cue text comes from the same canon span
+# _phrase_split resolved for the phrase, so nothing is lost, repeated or
+# reordered. No duration cap: a long madd hold must KEEP its word on screen.
+WORD_CUE_WORDS = 3
+WORD_CUE_GAP = 0.25
 
 
 def snap_words_to_silence(
@@ -297,6 +310,19 @@ def _silence_between(
     return total
 
 
+def _canon_forms(raw: str) -> set[str]:
+    """Normalized lookup forms of one canon word. A vocative compound
+    (يَـٰٓأَيُّهَا = يَا أَيُّهَا) is ONE canon word but TWO ASR tokens, so the
+    split forms are registered too — otherwise the ASR's "يا"/"أيها" matches
+    neither the ayah they open nor its predecessor."""
+    n = _normalize(raw)
+    forms = {n, _normalize_std(raw)}
+    if "\u0670" in raw and n.startswith("يا") and len(n) > 3:
+        forms.add("يا")
+        forms.add("ا" + n[2:])
+    return forms
+
+
 def _map_words_to_canon(ws: list[dict], text_ar: str) -> list[int | None] | None:
     """Map ASR words to their canon words inside one ayah's text.
 
@@ -316,7 +342,7 @@ def _map_words_to_canon(ws: list[dict], text_ar: str) -> list[int | None] | None
         return None
     lookup: dict[str, list[int]] = {}
     for i, raw in enumerate(canon):
-        for v in {_normalize(raw), _normalize_std(raw)}:
+        for v in _canon_forms(raw):
             lookup.setdefault(v, []).append(i)
     # per-index comparable form for the fuzzy fallback
     uth = [_normalize(w) for w in canon]
@@ -412,7 +438,10 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
             raw_tail = (seg.get("text_ar") or "").split()
             e = _madd_extend(e, raw_tail[-1] if raw_tail else "",
                              True, silence_runs, raw_segs, float("inf"))
-            seg = dict(seg, start=s, end=e)
+            # _ws keeps this phrase's OWN words for the word-cue pass: a madd
+            # hold can push the phrase end past the next ayah's first word, and
+            # time-window membership would then pull that foreign word in.
+            seg = dict(seg, start=s, end=e, _ws=ws)
         return [seg]
 
     # Regions between cuts.
@@ -485,7 +514,15 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
                 m1 = n_ar - 1          # recover a misheard tail (not a repeated ending)
             per.append((m0, m1 + 1))
         if per:
-            spans = per
+            # A phrase must begin where its predecessor ended: a canon word
+            # the ASR misheard between two phrases maps to no word, so
+            # min(got) would step past it and the word would never be shown
+            # (measured: 59:14 lost جُدُرِۭۚ between two breath phrases).
+            fixed, prev_end = [], 0
+            for a, b in per:
+                fixed.append((min(a, prev_end), b))
+                prev_end = b
+            spans = fixed
 
     out = []
     prev_b_ar = 0
@@ -542,6 +579,8 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
             "text_ar": " ".join(ar_words[a_ar:b_ar]).strip(),
             "text_en": " ".join(en_words[a_en:b_en]).strip(),
         })
+        if raw_segs:
+            phrase["_ws"] = [ws[i] for i in range(lo, hi + 1)]
         out.append(phrase)
     return out
 
@@ -937,6 +976,133 @@ def segments_from_word_times(
     return apply_sync_padding(segments, silence_runs)
 
 
+def _cue_groups(ws: list[dict], cpos: list[int | None]) -> list[list[int]]:
+    """Group one phrase's words into display cues: at most WORD_CUE_WORDS
+    canon words, or up to a WORD_CUE_GAP articulation break. A repeat (canon
+    index jumping back) always starts a new cue so its text cannot be folded
+    into the passage before it."""
+    groups: list[list[int]] = [[0]]
+    first = cpos[0]
+    for i in range(1, len(ws)):
+        cur = groups[-1]
+        canon = cpos[i]
+        gap = float(ws[i]["start"]) - float(ws[i - 1]["end"])
+        repeat = canon is not None and first is not None and canon < first
+        wide = (canon is not None and first is not None
+                and canon - first + 1 > WORD_CUE_WORDS)
+        if gap >= WORD_CUE_GAP or repeat or wide:
+            groups.append([i])
+            first = canon
+        else:
+            cur.append(i)
+    return groups
+
+
+def _word_cues(seg: dict, ws: list[dict], silence_runs: list | None = None,
+               raw_segs: list | None = None) -> list[dict]:
+    """Cut one phrase caption into word-tracked cues (see WORD_CUE_*).
+
+    Text stays canon and complete: each cue takes the span of canon words its
+    own word stamps recite (via _map_words_to_canon, so a REPEAT cuts at the
+    repeated words instead of by word count), every cue keeps at least one
+    word, and the last cue takes the remainder. Timing: the first cue keeps
+    the phrase onset (VAD-clamped head recovery) and the last keeps the phrase
+    end (madd hold); interior cues use their own word stamps, with a madd
+    word held into continuing voicing up to the next cue's onset."""
+    if len(ws) < 2:
+        return [seg]
+    ar_words = (seg.get("text_ar") or "").split()
+    en_words = (seg.get("text_en") or "").split()
+    n_ar, n_en = len(ar_words), len(en_words)
+    if not n_ar:
+        return [seg]
+    cpos = _map_words_to_canon(ws, seg.get("text_ar") or "")
+    if cpos is None:
+        return [seg]
+    groups = _cue_groups(ws, cpos)
+    while len(groups) > n_ar:  # more cues than words: fold the tail cues
+        groups[-2].extend(groups.pop())
+
+    # Canon span per cue. A cue starts at its first recognised word, but never
+    # before the previous cue's end and always leaving a word for every later
+    # cue; the last cue takes everything left.
+    bounds = [0]
+    for gi in range(1, len(groups)):
+        got = [cpos[i] for i in groups[gi] if cpos[i] is not None]
+        a = min(got) if got else bounds[-1] + 1
+        a = max(a, bounds[-1] + 1)
+        a = min(a, n_ar - (len(groups) - gi))
+        bounds.append(min(n_ar, max(bounds[-1] + 1, a)))
+    bounds.append(n_ar)
+
+    cues: list[dict] = []
+    prev_en = 0
+    last_gi = len(groups) - 1
+    for gi, g in enumerate(groups):
+        a_ar, b_ar = bounds[gi], bounds[gi + 1]
+        if n_en:
+            a_en = prev_en
+            if gi == last_gi:
+                b_en = n_en
+            else:
+                left = last_gi - gi
+                b_en = round(b_ar * n_en / n_ar)
+                b_en = _snap_en_boundary(en_words, a_en, b_en)
+                # Never eat an English word a later cue still needs: the snap
+                # can run forward to the ayah's closing period and leave every
+                # cue after it with Arabic but no translation (measured: 14).
+                b_en = min(b_en, n_en - left)
+                b_en = max(b_en, min(a_en + 1, n_en))
+            prev_en = b_en
+        else:
+            a_en = b_en = 0
+        start = float(ws[g[0]]["start"])
+        if gi == 0:
+            start = min(start, float(seg["start"]))
+        end = float(ws[g[-1]]["end"])
+        if gi == last_gi:
+            end = float(seg["end"])
+        elif raw_segs:
+            cap_next = float(ws[groups[gi + 1][0]]["start"]) - MIN_GAP
+            end = _madd_extend(end, ar_words[b_ar - 1], False,
+                               silence_runs, raw_segs, cap_next)
+        cue = dict(seg)
+        cue.update({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text_ar": " ".join(ar_words[a_ar:b_ar]).strip(),
+            "text_en": " ".join(en_words[a_en:b_en]).strip(),
+        })
+        cues.append(cue)
+    return cues
+
+
+def subdivide_word_cues(segments: list[dict], words: list[dict],
+                        silence_runs: list | None = None,
+                        raw_segs: list | None = None) -> list[dict]:
+    """Re-cut every phrase caption into word-tracked cues. Segments without
+    word stamps (openers, wordless bridges) are kept as they are.
+
+    A segment that carries "_ws" (provider path: the phrase's own recited
+    words) is cut from exactly those words — a window by time would also pick
+    up a neighbouring ayah's word whenever a madd hold stretches the phrase
+    end past it. Legacy callers fall back to midpoint membership."""
+    if not words:
+        return segments
+    ws_all = sorted(words, key=lambda w: float(w.get("start", 0.0)))
+    mids = [(float(w.get("start", 0.0)) + float(w.get("end", 0.0))) / 2
+            for w in ws_all]
+    out: list[dict] = []
+    for seg in segments:
+        own = seg.get("_ws")
+        if own is None:
+            lo = bisect_left(mids, float(seg["start"]) - 0.02)
+            hi = bisect_right(mids, float(seg["end"]) + 0.02)
+            own = ws_all[lo:hi]
+        out.extend(_word_cues(seg, own, silence_runs, raw_segs))
+    return out
+
+
 def segments_from_provider_times(
     matches: list, words: list[dict], silence_runs: list | None = None,
     raw_segs: list[tuple[float, float]] | None = None,
@@ -995,10 +1161,14 @@ def segments_from_provider_times(
         segments.extend(_phrase_split(seg, ws, silence_runs, raw_segs, cpos))
     segments.sort(key=lambda s: s["start"])
     _close_wordless_holes(segments, raw_segs, silence_runs)
-    return apply_sync_padding(
+    segments = subdivide_word_cues(segments, words, silence_runs, raw_segs)
+    segments = apply_sync_padding(
         inject_opener_segments(matches, words, segments, silence_runs, raw_segs),
         silence_runs,
     )
+    for s in segments:
+        s.pop("_ws", None)
+    return segments
 
 
 def _close_chain_holes(ordered, words, used_idx: set[int], texts_ar) -> None:
@@ -1048,7 +1218,11 @@ def _close_chain_holes(ordered, words, used_idx: set[int], texts_ar) -> None:
 
     def canon_words(surah: int, ayah: int) -> set[str]:
         txt = texts_ar.get(f"{surah}:{ayah}", "")
-        return {_normalize(w) for w in txt.split() if w}
+        forms: set[str] = set()
+        for w in txt.split():
+            if w:
+                forms |= _canon_forms(w)
+        return forms
 
     for i in range(len(ordered) - 1):
         (key_a, ws_a), (key_b, ws_b) = ordered[i], ordered[i + 1]
@@ -1146,7 +1320,7 @@ def _close_wordless_holes(segments: list[dict], raw_segs,
             if island_end - island_start <= 0.10:
                 continue
             out.append(dict(a, start=round(island_start, 3),
-                            end=round(island_end - 0.001, 3)))
+                            end=round(island_end - 0.001, 3), _ws=[]))
     segments[:] = out
 
 

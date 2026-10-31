@@ -202,8 +202,13 @@ def test_midayah_skipped_word_is_covered_end_to_end():
     segs = segments_from_provider_times(
         matches, w, silence_runs=[], raw_segs=[(0.0, 2.6)]
     )
-    assert len(segs) == 1, [(s["start"], s["end"]) for s in segs]
-    assert segs[0]["end"] >= 1.8, segs[0]
+    # Word-tracked cues may cut the phrase in several pieces; the invariant is
+    # that the skipped word's AUDIO stays covered and its text is shown.
+    assert segs[0]["start"] <= 0.05, segs[0]
+    assert segs[-1]["end"] >= 1.8, [(s["start"], s["end"]) for s in segs]
+    joined = " ".join(s["text_ar"] for s in segs).split()
+    from data.quran_text import load_ayah_texts
+    assert joined == load_ayah_texts()["59:2"].split(), joined
 
 
 def test_repeat_does_not_shift_text_ahead_of_voice():
@@ -243,8 +248,13 @@ def test_repeat_does_not_shift_text_ahead_of_voice():
         matches, words, silence_runs=sil, raw_segs=[(0.0, 3.3), (3.9, 6.0)]
     )
     assert len(segs) >= 2, [(s["start"], s["end"]) for s in segs]
-    first = segs[0]["text_ar"].split()
-    last = segs[-1]["text_ar"].split()
+    before = [s for s in segs if s["start"] < 3.3]
+    after = [s for s in segs if s["start"] >= 3.3]
+    assert before and after
+    # Concatenated cue text (cues are now word-sized) must recite the ayah in
+    # order before the breath, and the repeated opening after it.
+    first = " ".join(s["text_ar"] for s in before).split()
+    last = " ".join(s["text_ar"] for s in after).split()
     assert first == canon[:11], first
     # the repeated phrase shows the repeated opening — never the ayah tail
     assert last == canon[:4], last

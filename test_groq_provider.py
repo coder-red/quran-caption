@@ -114,11 +114,18 @@ class TestGroqProvider(unittest.TestCase):
         self.assertEqual(m.chain[0][1], 112)
 
         segs = segments_from_provider_times(matches, res["words"])
-        self.assertEqual([s["ayah"] for s in segs], [1, 1, 2, 3, 4])
+        # Captions are word-tracked cues now, so an ayah may span several
+        # segments; the ayah order must still be the recited one.
+        ayahs = [s["ayah"] for s in segs]
+        self.assertEqual(sorted(set(ayahs)), [1, 2, 3, 4])
+        self.assertEqual(ayahs, sorted(ayahs))
+        self.assertTrue(all(s["start"] <= s["end"] for s in segs))
         self.assertEqual(segs[0]["text_ar"], load_ayah_texts()["1:1"])
         self.assertGreaterEqual(segs[0]["end"], segs[0]["start"])
-        self.assertEqual(segs[1]["text_ar"], load_ayah_texts()["112:1"])
-        self.assertEqual(segs[4]["surah"], 112)
+        first = " ".join(s["text_ar"] for s in segs[1:]
+                         if s["surah"] == 112 and s["ayah"] == 1)
+        self.assertEqual(first, load_ayah_texts()["112:1"])
+        self.assertEqual(segs[-1]["surah"], 112)
         self.assertLessEqual(segs[0]["start"], segs[1]["start"])
 
     def test_slice_packing_cuts_requests(self):

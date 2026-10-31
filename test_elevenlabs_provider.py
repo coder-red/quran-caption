@@ -118,7 +118,10 @@ class TestElevenLabsProvider(unittest.TestCase):
         self.assertEqual((m.surah, m.start_ayah, m.end_ayah), (112, 1, 4))
 
         segs = segments_from_provider_times(matches, res["words"])
-        self.assertEqual([s["ayah"] for s in segs], [1, 1, 2, 3, 4])
+        # Word-tracked cues: one ayah may span several segments.
+        ayahs = [s["ayah"] for s in segs]
+        self.assertEqual(sorted(set(ayahs)), [1, 2, 3, 4])
+        self.assertEqual(ayahs, sorted(ayahs))
         self.assertEqual(segs[0]["text_ar"], load_ayah_texts()["1:1"])
 
 
