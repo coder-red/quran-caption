@@ -124,7 +124,7 @@ def test_scripts_cannot_trip_streamlits_dompurify_mxss_guard():
     trip = re.compile(r"<[/\w!]")
     root = os.path.dirname(os.path.abspath(__file__))
 
-    for name in ("sync_inspector.js",):
+    for name in ("sync_inspector.js", "opus_proxy.js", "auto_proxy.js"):
         with open(os.path.join(root, "frontend", name), encoding="utf-8") as f:
             hits = trip.findall(f.read())
         assert not hits, f"{name} contains a DOMPurify tripwire: {hits}"

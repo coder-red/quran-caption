@@ -24,6 +24,18 @@ if DEPLOYED:
     API_URL = "http://127.0.0.1:8000"
     PUBLIC_URL = ""
 
+# Fast upload: the browser extracts a video's audio and uploads only that
+# (see frontend/opus_proxy.js and frontend/auto_proxy.js).
+def _read_asset(name: str) -> str:
+    try:
+        with open(os.path.join(_HERE, name), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+_PROXY_JS = _read_asset("opus_proxy.js") + "\n" + _read_asset("auto_proxy.js")
+
 
 @st.cache_resource
 def _ensure_backend():
@@ -282,6 +294,10 @@ ss.setdefault("render_job_id", None)
 ss.setdefault("video_media_id", None)
 ss.setdefault("video_uploaded", False)
 ss.setdefault("video_meta", None)
+# Preview of the burn-in video, fetched once it is on the server: the fast
+# upload only sends the audio, so the picture arrives later.
+ss.setdefault("preview_video_uri", None)
+ss.setdefault("preview_video_tried", False)
 
 
 def api_error(resp: requests.Response):
@@ -733,8 +749,12 @@ def ensure_media():
             cap_mb = float(os.environ.get("QCAP_PREVIEW_INLINE_MB", "8") or 8)
             if pv.status_code == 200 and pv.content:
                 if len(pv.content) <= cap_mb * 1024 * 1024:
+                    # Audio sources (the fast-upload proxy, plain audio) come
+                    # back as their real type — labelling Ogg as video/mp4
+                    # makes the browser refuse to play it.
+                    ctype = (pv.headers.get("content-type") or "video/mp4").split(";")[0].strip()
                     ss["media_data_uri"] = (
-                        "data:video/mp4;base64," + base64.b64encode(pv.content).decode()
+                        f"data:{ctype};base64," + base64.b64encode(pv.content).decode()
                     )
                 else:
                     ss["media_data_uri"] = None
@@ -756,6 +776,36 @@ def ensure_media():
             st.warning(f"Video preview unavailable: {e}")
     else:
         ss["media_url"] = PUBLIC_URL + f"/media/{ss['media_id']}"
+
+
+def ensure_video_preview():
+    """Swap in the real picture once the burn-in video is on the server.
+
+    The fast upload only sends the audio, so the player starts on a black
+    frame; the video the user picked is uploaded for the burn-in and its
+    preview replaces the audio one as soon as it has arrived."""
+    if not ss.get("video_uploaded") or not ss.get("video_media_id"):
+        return
+    if ss.get("preview_video_uri") or ss.get("preview_video_tried"):
+        return
+    if not DEPLOYED:
+        ss["preview_video_uri"] = PUBLIC_URL + f"/media/{ss['video_media_id']}"
+    else:
+        cap_mb = float(os.environ.get("QCAP_PREVIEW_INLINE_MB", "8") or 8)
+        try:
+            pv = requests.get(
+                f"{API_URL}/media/{ss['video_media_id']}/preview", timeout=1200
+            )
+        except requests.RequestException:
+            return  # retry on a later rerun
+        ss["preview_video_tried"] = True
+        if pv.status_code == 200 and pv.content and len(pv.content) <= cap_mb * 1024 * 1024:
+            ctype = (pv.headers.get("content-type") or "video/mp4").split(";")[0].strip()
+            ss["preview_video_uri"] = (
+                f"data:{ctype};base64," + base64.b64encode(pv.content).decode()
+            )
+    if ss.get("preview_video_uri"):
+        ss["media_data_uri"] = None  # the audio preview is superseded
 
 
 def show_detection(result: dict):
@@ -789,6 +839,8 @@ uploaded = st.file_uploader(
     label_visibility="collapsed",
     key="file_uploader",
 )
+if _PROXY_JS.strip():
+    st.html(f"<script>{_PROXY_JS}</script>", unsafe_allow_javascript=True)
 if uploaded is not None:
     if uploaded.size > MAX_SIZE:
         st.error(f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — trim long recordings before uploading on mobile.")
@@ -812,6 +864,11 @@ if uploaded is not None:
         ss["media_url"] = None
         ss["media_data_uri"] = None
         ss["media_uploaded"] = False
+        ss["video_media_id"] = None
+        ss["video_uploaded"] = False
+        ss["video_meta"] = None
+        ss["preview_video_uri"] = None
+        ss["preview_video_tried"] = False
 
 if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_result"] is None:
     if ss["file_bytes"] is not None:
@@ -931,6 +988,7 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
 # ---------------------------------------------------------------- Step 2: sync & preview editor
 if ss["align_result"] is not None and ss["segments"]:
     ensure_media()
+    ensure_video_preview()
 
     st.markdown('<div class="card"><h3><span class="step-badge">2</span> Sync & preview</h3></div>', unsafe_allow_html=True)
     st.caption("Overlay preview — captions are saved only in the rendered MP4 below.")
@@ -978,8 +1036,8 @@ if ss["align_result"] is not None and ss["segments"]:
                 "Position", ["bottom", "middle", "top"], default=ss["styles"]["position"]
             )
 
-    if ss["media_url"] or ss.get("media_data_uri"):
-        src = ss.get("media_data_uri") or ss["media_url"]
+    src = ss.get("preview_video_uri") or ss.get("media_data_uri") or ss["media_url"]
+    if src:
         st.html(
             player_html(
                 src, ss["segments"], ss["lang"], ss["styles"],
@@ -1024,17 +1082,21 @@ if ss["align_result"] is not None and ss["segments"]:
         (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
     )
     if _audio_only:
-        st.info("This recitation is audio only — add the matching video to burn the captions into it.")
+        st.caption("The video the captions are burned into.")
         _vfile = st.file_uploader(
             "Video for the burned-in MP4",
             type=["mp4", "webm", "mov", "avi", "mkv"],
             label_visibility="collapsed",
-            key="video_uploader",
+            # A new clip gets a fresh widget, so the previous clip's video
+            # can never be rendered under the new captions.
+            key=f"video_uploader_{ss['media_id']}",
         )
         if _vfile is not None:
             if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
                 ss["video_media_id"] = uuid.uuid4().hex[:10]
                 ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
+                ss["preview_video_uri"] = None
+                ss["preview_video_tried"] = False
             if not ss.get("video_uploaded"):
                 try:
                     up = requests.post(
@@ -1046,7 +1108,9 @@ if ss["align_result"] is not None and ss["segments"]:
                         st.error(f"Video upload failed: {api_error(up)}")
                     else:
                         ss["video_uploaded"] = True
-                        st.success("Original video uploaded — ready to render.")
+                        # Swap the preview from the audio to the real picture
+                        # and drop the "uploading in the background" note.
+                        st.rerun()
                 except requests.RequestException as e:
                     st.error(f"Video upload failed: {e}")
             else:
