@@ -1,5 +1,4 @@
-﻿import base64
-import json
+﻿import json
 import os
 import sys
 import time
@@ -16,6 +15,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from sync_inspector import inspector_html as sync_inspector_html  # noqa: E402
+import media_store  # noqa: E402
 
 API_URL = os.environ.get("QCAP_API_URL", "http://localhost:8000")
 PUBLIC_URL = os.environ.get("QCAP_PUBLIC_URL", API_URL)
@@ -35,6 +35,27 @@ def _read_asset(name: str) -> str:
 
 
 _PROXY_JS = _read_asset("opus_proxy.js") + "\n" + _read_asset("auto_proxy.js")
+
+# Deployed browsers cannot reach the API port, so clips cross this process:
+# frontend/media_store.py sends them in 4MB slices and publishes the previews
+# into Streamlit's static dir (range-request streaming from disk). A single
+# 40MB multipart body plus inlined base64 previews OOM-killed the 512MB host.
+_TEMP_DIR = os.path.abspath(os.environ.get("TEMP_DIR") or "temp")
+_STATIC_DIR = os.path.join(_HERE, "static")
+
+
+def post_media(media_id: str, name: str, source, ctype: str = ""):
+    return media_store.post_media(API_URL, media_id, name, source, ctype)
+
+
+def publish_media(media_id: str):
+    if not DEPLOYED:
+        return None
+    return media_store.publish_media(_TEMP_DIR, _STATIC_DIR, media_id)
+
+
+def prune_static(media_ids):
+    media_store.prune_static(_STATIC_DIR, media_ids)
 
 
 @st.cache_resource
@@ -712,9 +733,9 @@ def ensure_media():
     """Resolve a playable preview for the server-side media copy.
 
     The file is uploaded ONCE (at Generate time); this only resolves the
-    URL / data-URI, falling back to a one-time upload for legacy sessions
+    URL, falling back to a one-time upload for legacy sessions
     or after an engine restart wiped the server copy."""
-    if ss["media_url"] is not None or ss.get("media_data_uri"):
+    if ss["media_url"] is not None:
         return
     if ss["media_id"] is None:
         return
@@ -724,10 +745,9 @@ def ensure_media():
             st.warning("Video preview unavailable: re-select the file to upload it again.")
             return
         try:
-            resp = requests.post(
-                f"{API_URL}/media/{ss['media_id']}",
-                files={"file": (ss["file_meta"]["name"], payload, ss["file_meta"]["type"])},
-                timeout=300,
+            resp = post_media(
+                ss["media_id"], ss["file_meta"]["name"], payload,
+                ss["file_meta"]["type"],
             )
             if resp.status_code != 200:
                 st.warning(f"Video preview unavailable: {api_error(resp)}")
@@ -738,42 +758,13 @@ def ensure_media():
             st.warning(f"Video preview unavailable: {e}")
             return
     if DEPLOYED:
-        try:
-            pv = requests.get(f"{API_URL}/media/{ss['media_id']}/preview", timeout=1200)
-            # Inlining the whole preview as a base64 data URI costs ~33% extra
-            # bytes, holds that copy in session_state for the life of the
-            # session, and re-sends it over the websocket on EVERY rerun
-            # (style/lang/segment edits all rerun). On a 512MB host that
-            # growth is what tips the service into the OOM killer, and it
-            # makes every interaction slow. Only inline while it is cheap.
-            cap_mb = float(os.environ.get("QCAP_PREVIEW_INLINE_MB", "8") or 8)
-            if pv.status_code == 200 and pv.content:
-                if len(pv.content) <= cap_mb * 1024 * 1024:
-                    # Audio sources (the fast-upload proxy, plain audio) come
-                    # back as their real type — labelling Ogg as video/mp4
-                    # makes the browser refuse to play it.
-                    ctype = (pv.headers.get("content-type") or "video/mp4").split(";")[0].strip()
-                    ss["media_data_uri"] = (
-                        f"data:{ctype};base64," + base64.b64encode(pv.content).decode()
-                    )
-                else:
-                    ss["media_data_uri"] = None
-                    st.warning(
-                        f"Preview skipped: this clip's preview is "
-                        f"{len(pv.content)/1e6:.0f} MB (over the {cap_mb:.0f} MB "
-                        "inline limit) and inlining it would exhaust this host's "
-                        "memory. Captions below are still correct — set "
-                        "QCAP_PUBLIC_URL to a public API URL to restore the "
-                        "video preview."
-                    )
-            elif pv.status_code == 404:
-                # Engine restarted and lost the copy — re-upload next run.
-                ss["media_uploaded"] = False
-                st.warning("Video preview unavailable: engine restarted, press Generate Captions again.")
-            else:
-                st.warning("Video preview unavailable on this instance.")
-        except requests.RequestException as e:
-            st.warning(f"Video preview unavailable: {e}")
+        url = publish_media(ss["media_id"])
+        if url:
+            ss["media_url"] = url
+        else:
+            # Engine restarted and lost the copy — re-upload next run.
+            ss["media_uploaded"] = False
+            st.warning("Video preview unavailable: engine restarted, press Generate Captions again.")
     else:
         ss["media_url"] = PUBLIC_URL + f"/media/{ss['media_id']}"
 
@@ -783,7 +774,7 @@ def ensure_video_preview():
 
     The fast upload only sends the audio, so the player starts on a black
     frame; the video the user picked is uploaded for the burn-in and its
-    preview replaces the audio one as soon as it has arrived."""
+    file replaces the audio one as soon as it has arrived."""
     if not ss.get("video_uploaded") or not ss.get("video_media_id"):
         return
     if ss.get("preview_video_uri") or ss.get("preview_video_tried"):
@@ -791,21 +782,10 @@ def ensure_video_preview():
     if not DEPLOYED:
         ss["preview_video_uri"] = PUBLIC_URL + f"/media/{ss['video_media_id']}"
     else:
-        cap_mb = float(os.environ.get("QCAP_PREVIEW_INLINE_MB", "8") or 8)
-        try:
-            pv = requests.get(
-                f"{API_URL}/media/{ss['video_media_id']}/preview", timeout=1200
-            )
-        except requests.RequestException:
-            return  # retry on a later rerun
         ss["preview_video_tried"] = True
-        if pv.status_code == 200 and pv.content and len(pv.content) <= cap_mb * 1024 * 1024:
-            ctype = (pv.headers.get("content-type") or "video/mp4").split(";")[0].strip()
-            ss["preview_video_uri"] = (
-                f"data:{ctype};base64," + base64.b64encode(pv.content).decode()
-            )
-    if ss.get("preview_video_uri"):
-        ss["media_data_uri"] = None  # the audio preview is superseded
+        url = publish_media(ss["video_media_id"])
+        if url:
+            ss["preview_video_uri"] = url
 
 
 def show_detection(result: dict):
@@ -851,6 +831,7 @@ if uploaded is not None:
         or getattr(uploaded, "file_id", None) != ss["file_meta"].get("file_id")
     )
     if is_new:
+        prune_static([ss.get("media_id"), ss.get("video_media_id")])
         ss["file_bytes"] = uploaded.getvalue()
         ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
         ss["align_result"] = None
@@ -862,7 +843,6 @@ if uploaded is not None:
         ss["render_job_id"] = None
         ss["media_id"] = uuid.uuid4().hex[:10]
         ss["media_url"] = None
-        ss["media_data_uri"] = None
         ss["media_uploaded"] = False
         ss["video_media_id"] = None
         ss["video_uploaded"] = False
@@ -892,10 +872,9 @@ if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_resu
                     if payload is None:
                         st.error("Upload failed: file bytes unavailable — re-select the file.")
                         st.stop()
-                    up = requests.post(
-                        f"{API_URL}/media/{ss['media_id']}",
-                        files={"file": (ss["file_meta"]["name"], payload, ss["file_meta"]["type"])},
-                        timeout=300,
+                    up = post_media(
+                        ss["media_id"], ss["file_meta"]["name"], payload,
+                        ss["file_meta"]["type"],
                     )
                     if up.status_code != 200:
                         st.error(f"Upload failed: {api_error(up)}")
@@ -1036,7 +1015,7 @@ if ss["align_result"] is not None and ss["segments"]:
                 "Position", ["bottom", "middle", "top"], default=ss["styles"]["position"]
             )
 
-    src = ss.get("preview_video_uri") or ss.get("media_data_uri") or ss["media_url"]
+    src = ss.get("preview_video_uri") or ss["media_url"]
     if src:
         st.html(
             player_html(
@@ -1099,11 +1078,10 @@ if ss["align_result"] is not None and ss["segments"]:
                 ss["preview_video_tried"] = False
             if not ss.get("video_uploaded"):
                 try:
-                    up = requests.post(
-                        f"{API_URL}/media/{ss['video_media_id']}",
-                        files={"file": (_vfile.name, _vfile.getvalue(), _vfile.type)},
-                        timeout=1800,
-                    )
+                    with st.spinner("Uploading the original video…"):
+                        up = post_media(
+                            ss["video_media_id"], _vfile.name, _vfile, _vfile.type
+                        )
                     if up.status_code != 200:
                         st.error(f"Video upload failed: {api_error(up)}")
                     else:
@@ -1135,10 +1113,9 @@ if ss["align_result"] is not None and ss["segments"]:
                 st.error("Upload failed: file bytes unavailable — re-select the file.")
                 st.stop()
             try:
-                up = requests.post(
-                    f"{API_URL}/media/{ss['media_id']}",
-                    files={"file": (ss["file_meta"]["name"], payload, ss["file_meta"]["type"])},
-                    timeout=300,
+                up = post_media(
+                    ss["media_id"], ss["file_meta"]["name"], payload,
+                    ss["file_meta"]["type"],
                 )
                 if up.status_code != 200:
                     st.error(f"Upload failed: {api_error(up)}")

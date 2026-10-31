@@ -1,0 +1,16 @@
+[theme]
+base = "dark"
+primaryColor = "#10B981"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#141E33"
+textColor = "#E6EAF2"
+
+[server]
+fileWatcherType = "none"
+# Must cover the app's 400MB cap (Streamlit defaults to 200MB, which
+# would reject large recitations before our own check runs).
+maxUploadSize = 400
+# Serves ./static at /app/static/ with HTTP range support, so the deployed
+# browser streams the user's video from disk instead of the app inlining a
+# base64 transcode (which OOM-killed the 512MB host during large uploads).
+enableStaticServing = true

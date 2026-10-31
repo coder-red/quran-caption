@@ -733,15 +733,59 @@ def _media_type(path: str) -> str:
     return mimetypes.guess_type(path)[0] or "application/octet-stream"
 
 
+def _media_path(media_id: str, ext: str) -> str:
+    """Storage path for an uploaded clip. The extension comes from the client
+    filename, so anything that is not a short alphanumeric suffix is ignored."""
+    ext = (ext or "").lower()
+    if len(ext) > 9 or not ext.startswith(".") or not ext[1:].isalnum():
+        ext = ".mp4"
+    return os.path.join(TEMP_DIR, f"media_{media_id}{ext}")
+
+
+async def _write_upload(file: UploadFile, path: str, offset: int = 0) -> int:
+    """Copy an upload to disk in slices — never the whole body at once.
+    A 40MB clip read (and multipart-parsed) in one go was enough to OOM the
+    512MB free host, which restarted mid-upload."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    if offset > 0 and os.path.exists(path):
+        fh = open(path, "r+b")
+    else:
+        fh = open(path, "wb")
+        offset = 0
+    with fh:
+        fh.seek(offset)
+        while True:
+            buf = await file.read(1 << 20)
+            if not buf:
+                break
+            fh.write(buf)
+    return os.path.getsize(path)
+
+
 @app.post("/media/{media_id}")
 async def upload_media(media_id: str, file: UploadFile = File(...)):
-    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-    path = os.path.join(TEMP_DIR, f"media_{media_id}{ext}")
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(await file.read())
+    path = _media_path(media_id, os.path.splitext(file.filename or "video.mp4")[1])
+    await _write_upload(file, path)
     MEDIA_FILES[media_id] = path
     return {"url": f"/media/{media_id}"}
+
+
+@app.post("/media/{media_id}/chunk")
+async def upload_media_chunk(
+    media_id: str,
+    offset: int = Form(0),
+    total: int = Form(0),
+    ext: str = Form(".mp4"),
+    file: UploadFile = File(...),
+):
+    """One slice of a large upload. The client sends 4MB pieces so neither
+    process ever holds the whole clip; `total` marks the final size."""
+    path = _media_path(media_id, ext)
+    size = await _write_upload(file, path, offset)
+    if total <= 0 or size >= total:
+        MEDIA_FILES[media_id] = path
+    return {"received": size}
+
 
 
 @app.get("/media/{media_id}")

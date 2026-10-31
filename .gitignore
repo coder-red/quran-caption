@@ -24,6 +24,12 @@ __pycache__/
 !data/quran_uthmani.json
 !data/quran_en.json
 
+# Published previews (Streamlit serves ./static — runtime copies of uploads)
+frontend/static/*
+!frontend/static/.gitkeep
+deploy/space/frontend/static/*
+!deploy/space/frontend/static/.gitkeep
+
 # Logs
 *.log
 
