@@ -311,6 +311,38 @@ def test_align_impl_falls_back_to_groq(monkeypatch):
     assert calls["fallback"] == 1
 
 
+def test_align_impl_reports_fallback_reason(monkeypatch):
+    """The response must say WHY the fallback ran: the deployed host cannot
+    be probed from outside and the stage text is gone once the job finishes."""
+    import backend.main as m
+    from backend.models import AlignResponse
+
+    wav = os.path.join("data", "test_multisurah.wav")
+    if not os.path.exists(wav):
+        pytest.skip("no wav fixture")
+
+    class FakeQud:
+        name = "qud"
+
+    class FakeGroq:
+        name = "groq"
+
+    monkeypatch.setattr(m, "get_asr_provider",
+                        lambda name=None: FakeQud() if name == "qud" else FakeGroq())
+    monkeypatch.setattr(m, "_align_with_qud",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            QudUnavailable("HTTP 402: GPU quota exhausted")))
+    monkeypatch.setattr(
+        m, "_align_with_provider",
+        lambda *a, **k: AlignResponse(
+            surah={"id": 1, "name_ar": "الفاتحة", "name_en": "Al-Fatihah"},
+            start_ayah=1, end_ayah=1, confidence=1.0,
+            words=[], chunks=[], segments=[], srt="", vtt="", engine="groq"))
+    out = m._align_impl(None, asr_backend="qud", media_path=wav)
+    assert out.engine == "groq"
+    assert "402" in out.engine_note and "QUD unavailable" in out.engine_note
+
+
 def test_align_impl_reports_qud_failure_when_no_fallback(monkeypatch):
     import backend.main as m
 

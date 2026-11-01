@@ -267,8 +267,11 @@ def _align_impl(
                     return ErrorResponse(error=f"QUD aligner failed: {exc}")
                 setp(f"QUD unavailable ({exc}) — falling back to "
                      f"{QUD_FALLBACK}…", 20)
-                return _align_with_provider(fallback, audio_path, segs, setp,
-                                            sil_runs, raw_segs, _hold_end)
+                response = _align_with_provider(fallback, audio_path, segs, setp,
+                                                sil_runs, raw_segs, _hold_end)
+                if isinstance(response, AlignResponse):
+                    response.engine_note = f"QUD unavailable: {exc}"
+                return response
         if provider is not None:
             return _align_with_provider(provider, audio_path, segs, setp,
                                         sil_runs, raw_segs, _hold_end)

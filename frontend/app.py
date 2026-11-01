@@ -819,6 +819,8 @@ def show_detection(result: dict):
         """,
         unsafe_allow_html=True,
     )
+    if result.get("engine_note"):
+        st.caption(f"Alignment note — {result['engine_note']}")
 
 
 # ---------------------------------------------------------------- Step 1: upload

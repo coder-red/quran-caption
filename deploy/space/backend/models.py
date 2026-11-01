@@ -62,6 +62,10 @@ class AlignResponse(BaseModel):
     # QUD can silently fall back to Groq on quota/outage, so the client must
     # be able to tell which one actually ran.
     engine: str = ""
+    # Why a fallback engine ran (e.g. the QUD failure). Empty on a clean run;
+    # the deployed host cannot be probed from outside, so this is how a live
+    # fallback is diagnosed.
+    engine_note: str = ""
 
 
 class RenderRequest(BaseModel):
