@@ -140,11 +140,43 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
+def _cpu_quota() -> float:
+    """CPU cores this process may use, from the container's cgroup quota.
+
+    The free deploy host reports many host cores but allows 0.1 CPU, so
+    os.cpu_count() is useless there — the quota decides whether hardware
+    encoders can exist and how expensive x264 may be."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:  # cgroup v2
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            return float(quota) / float(period)
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as f:
+            quota = int(f.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as f:
+            period = int(f.read().strip())
+        if quota > 0 and period > 0:
+            return quota / period
+    except (OSError, ValueError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
 def detect_encoder() -> str:
     """Pick a working H.264 encoder, preferring hardware (fast)."""
     global _cached_encoder
     with _encoder_lock:
         if _cached_encoder:
+            return _cached_encoder
+
+        # A throttled container has no GPU, and probing encoders that are
+        # compiled in but unusable is not free: on the 0.1-CPU host it sat on
+        # "detecting..." for minutes and starved the health check.
+        if _cpu_quota() < 1.0:
+            _cached_encoder = "libx264"
             return _cached_encoder
 
         candidates = ["h264_qsv", "h264_nvenc", "h264_amf", "libx264"]
@@ -161,15 +193,19 @@ def detect_encoder() -> str:
             if enc == "libx264":
                 _cached_encoder = enc
                 return enc
-            test = subprocess.run(
-                [
-                    FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "lavfi", "-i", "color=size=64x64:rate=1:duration=0.1",
-                    "-c:v", enc, "-f", "null", "-",
-                ],
-                capture_output=True,
-                text=True,
-            )
+            try:
+                test = subprocess.run(
+                    [
+                        FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", "color=size=64x64:rate=1:duration=0.1",
+                        "-c:v", enc, "-f", "null", "-",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                continue
             if test.returncode == 0:
                 _cached_encoder = enc
                 return enc
@@ -185,15 +221,25 @@ def _encoder_args(encoder: str) -> list[str]:
         return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "23"]
     if encoder == "h264_amf":
         return ["-c:v", "h264_amf", "-quality", "quality", "-qp_i", "23", "-qp_p", "23"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    cores = _cpu_quota()
+    # ultrafast is ~2x the speed of veryfast for a slightly larger file — the
+    # right trade on a host that gives the whole app a fraction of a core.
+    preset = "ultrafast" if cores < 1.0 else "veryfast"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", "23",
+            "-threads", str(max(1, min(4, int(cores) or 1)))]
 
 
-def probe_duration(video_path: str) -> float:
+def _ffprobe_path() -> str | None:
     ffprobe = os.path.join(os.path.dirname(FFMPEG_PATH), "ffprobe.exe")
     if not os.path.isfile(ffprobe):
         ffprobe = os.path.join(os.path.dirname(FFMPEG_PATH), "ffprobe")
     if not os.path.isfile(ffprobe):
         ffprobe = shutil.which("ffprobe")
+    return ffprobe
+
+
+def probe_duration(video_path: str) -> float:
+    ffprobe = _ffprobe_path()
     if not ffprobe:
         return 0.0
     r = subprocess.run(
@@ -208,6 +254,21 @@ def probe_duration(video_path: str) -> float:
         return 0.0
 
 
+def has_video_stream(path: str) -> bool:
+    """False for an audio-only file — there is no picture to burn into."""
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return True  # cannot check; let FFmpeg report it
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_type",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True,
+        text=True,
+    )
+    return "video" in (r.stdout or "")
+
+
 def render_captions(
     video_path: str,
     srt_content: str,
@@ -218,6 +279,12 @@ def render_captions(
 ) -> str:
     os.makedirs(TEMP_DIR, exist_ok=True)
     styles = {**DEFAULT_STYLES, **(styles or {})}
+
+    if not has_video_stream(video_path):
+        raise RuntimeError(
+            "This file has no picture (it is the extracted soundtrack). "
+            "Render from the video itself so the captions are burned into the image."
+        )
 
     srt_fd, srt_path = tempfile.mkstemp(suffix=".srt", dir=TEMP_DIR)
     os.close(srt_fd)
@@ -251,6 +318,8 @@ def render_captions(
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace",
+        # Keep the web server responsive on a fractional-core host.
+        preexec_fn=(lambda: os.nice(10)) if hasattr(os, "nice") else None,
     )
 
     assert proc.stdout is not None

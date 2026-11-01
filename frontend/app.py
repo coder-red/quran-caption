@@ -58,6 +58,16 @@ def prune_static(media_ids):
     media_store.prune_static(_STATIC_DIR, media_ids)
 
 
+def source_is_video() -> bool:
+    """The picked clip was a video, whose soundtrack is uploaded first."""
+    return media_store.is_audio_proxy((ss.get("file_meta") or {}).get("name") or "")
+
+
+def source_video_name() -> str:
+    name = (ss.get("file_meta") or {}).get("name") or ""
+    return media_store.proxy_source_name(name) or name
+
+
 @st.cache_resource
 def _ensure_backend():
     """On Spaces: start the FastAPI child process. No model pre-downloads —
@@ -849,10 +859,19 @@ if uploaded is not None:
         ss["video_meta"] = None
         ss["preview_video_uri"] = None
         ss["preview_video_tried"] = False
+    if source_is_video():
+        st.caption(
+            f"Video received: **{source_video_name()}** — only its soundtrack "
+            "was sent ahead so captions can start now. The picture uploads "
+            "next for the burn-in, and the MP4 keeps your video."
+        )
 
 if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_result"] is None:
     if ss["file_bytes"] is not None:
-        st.video(ss["file_bytes"])
+        if source_is_video():
+            st.caption("Soundtrack ready to caption — your picture is uploaded with the burn-in below.")
+        else:
+            st.video(ss["file_bytes"])
     else:
         # Bytes were dropped after upload to save RAM; the server copy is
         # reused, so just offer Generate again (e.g. after a failed run).
@@ -971,6 +990,11 @@ if ss["align_result"] is not None and ss["segments"]:
 
     st.markdown('<div class="card"><h3><span class="step-badge">2</span> Sync & preview</h3></div>', unsafe_allow_html=True)
     st.caption("Overlay preview — captions are saved only in the rendered MP4 below.")
+    if source_is_video() and not ss.get("video_uploaded"):
+        st.caption(
+            "Your video is still uploading — the preview plays its soundtrack "
+            "for now and switches to the picture automatically when it lands."
+        )
 
     # Full-width stacked controls: the old 3-column row ([2,1,2] with an
     # empty spacer) squeezed to unreadable widths on phones. One control
@@ -1054,14 +1078,27 @@ if ss["align_result"] is not None and ss["segments"]:
     res_w, res_h = RESOLUTIONS[res_label]
 
     # An audio upload has no picture to burn the captions into, so the
-    # matching video is asked for here (once, at render time).
+    # matching video is asked for here (once, at render time). A video picked
+    # in step 1 arrives as its soundtrack first (frontend/auto_proxy.js) and
+    # is auto-filled here in the background — that upload is the picture the
+    # MP4 must use, never the proxy.
     _meta = ss.get("file_meta") or {}
     _name = (_meta.get("name") or "").lower()
     _audio_only = (_meta.get("type") or "").startswith("audio/") or _name.endswith(
         (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
     )
+    _from_video = source_is_video()
     if _audio_only:
-        st.caption("The video the captions are burned into.")
+        if _from_video:
+            if not ss.get("video_uploaded"):
+                st.info(
+                    "Sending your video to the caption engine in the background. "
+                    "You can keep editing — rendering unlocks as soon as it lands."
+                )
+            else:
+                st.caption(f"Video: {source_video_name()}")
+        else:
+            st.caption("The video the captions are burned into.")
         _vfile = st.file_uploader(
             "Video for the burned-in MP4",
             type=["mp4", "webm", "mov", "avi", "mkv"],
@@ -1094,16 +1131,25 @@ if ss["align_result"] is not None and ss["segments"]:
             else:
                 st.success("Original video uploaded — ready to render.")
         if not ss.get("video_uploaded"):
-            st.warning("Without a video, the render is audio only.")
+            if _from_video:
+                st.caption("If the automatic transfer stalled, pick the video file again above.")
+            else:
+                st.caption("Captions are burned into a picture — add the video to use.")
 
-    render_clicked = st.button("Render MP4 with captions", type="primary", use_container_width=True)
+    # Without the picture there is nothing to burn into, so the render stays
+    # locked instead of failing in FFmpeg (it needs a video stream).
+    _needs_video = _audio_only and not ss.get("video_uploaded")
+    render_clicked = st.button(
+        "Render MP4 with captions", type="primary", use_container_width=True,
+        disabled=_needs_video,
+    )
     if render_clicked:
+        if _needs_video:
+            st.error("The video has not finished uploading yet — the render needs the picture.")
+            st.stop()
         # The burn-in uses the ORIGINAL video when one was supplied, else the
         # media the captions were made from.
         _render_media_id = ss.get("video_media_id") or ss["media_id"]
-        if ss.get("video_media_id") and not ss.get("video_uploaded"):
-            st.error("The original video has not finished uploading yet.")
-            st.stop()
         # Render reuses the server-side copy (uploaded once at Generate
         # time) — no second upload. If the engine restarted since, upload
         # once more first.

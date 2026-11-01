@@ -137,8 +137,8 @@ DRIVE = textwrap.dedent("""
       assert(proxied, 'the video must go through the audio encoder');
       assert(proxied.opts && proxied.opts.format === 'ogg_opus', 'opus format');
       assert(window.__qcapSource === FAKE, 'the original stays in memory');
-      assert(MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'recitation_audio.ogg',
-             'the uploader must receive the proxy, got ' +
+      assert(MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'recitation.mp4.audio.ogg',
+             'the uploader must receive the soundtrack, got ' +
              (MAIN.files && MAIN.files[0] && MAIN.files[0].name));
       assert(MAIN.lastEvent && MAIN.lastEvent.type === 'change',
              'Streamlit must be told the file changed');
@@ -222,7 +222,30 @@ node_only = pytest.mark.skipif(shutil.which("node") is None, reason="node is not
 def test_video_is_proxied_and_the_burnin_gets_the_original(tmp_path):
     r = _run(tmp_path, "auto_proxy.js", DRIVE)
     assert r == {"ok": True, "source": "recitation.mp4",
-                 "proxy": "recitation_audio.ogg", "burn": "recitation.mp4"}
+                 "proxy": "recitation.mp4.audio.ogg", "burn": "recitation.mp4"}
+
+
+@node_only
+def test_the_shipped_proxy_name_is_readable_by_the_app(tmp_path):
+    """The JS names the proxy; frontend/media_store.py must recognize it.
+
+    If these drift apart the app treats a picked video as an audio upload
+    and can render (or refuse) the wrong thing."""
+    from frontend import media_store
+
+    name = _run(tmp_path, "auto_proxy_name.js", DRIVE)["proxy"]
+    assert media_store.is_audio_proxy(name)
+    assert media_store.proxy_source_name(name) == "recitation.mp4"
+
+
+def test_only_video_soundtracks_count_as_proxies():
+    from frontend import media_store
+
+    for name in ("recitation.mp4.audio.ogg", "clip.MOV.audio.ogg"):
+        assert media_store.is_audio_proxy(name), name
+    for name in ("clip.mp3", "clip.ogg", "foo_audio.ogg", "recitation.mp4",
+                 "notes.audio.ogg"):
+        assert not media_store.is_audio_proxy(name), name
 
 
 @node_only

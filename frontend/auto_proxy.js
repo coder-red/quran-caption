@@ -123,12 +123,14 @@
       }
       return window.QcapProxy.buildAudioProxy(f, { bitrate: 32000, format: 'ogg_opus' });
     }).then(function (res) {
-      // Name it so the uploader and the render step later make clear this is
-      // only the soundtrack of a video the user picked.
-      var base = (f.name || 'clip').replace(/\.[^.]+$/, '');
-      res.file = new File([res.file], base + '_audio.ogg', { type: 'audio/ogg' });
+      // Keep the video's own name and extension in the proxy name: the app
+      // reads a name ending in ".audio.ogg" as a picked video's soundtrack
+      // and refuses to render the MP4 from it (frontend/media_store.py).
+      var base = f.name || 'clip.mp4';
+      res.file = new File([res.file], base + '.audio.ogg', { type: 'audio/ogg' });
       window.__qcapProxyFile = res.file;
-      note('Audio ' + fmtSize(res.bytes) + ' of ' + fmtSize(f.size) + ' — uploading');
+      note('Video accepted — sending its soundtrack (' + fmtSize(res.bytes)
+           + ' of ' + fmtSize(f.size) + ') first');
       hand(input, res.file);
     }).catch(function () {
       note('Could not extract the audio — uploading the video itself.', true);

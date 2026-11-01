@@ -12,11 +12,31 @@ recitation crosses this process. Two rules keep a 512MB instance alive:
 """
 import io
 import os
+import re
 import shutil
 
 import requests
 
 CHUNK = 4 * 1024 * 1024
+
+# The browser's fast upload sends a video's soundtrack as
+# "<original name>.audio.ogg" (frontend/auto_proxy.js). Only the soundtrack
+# is needed to time the captions, but the picture still has to arrive before
+# the MP4 can be burned in — so the app must tell this proxy apart from a
+# real audio upload and never render from it.
+_PROXY_RE = re.compile(
+    r"(\.(?:mp4|webm|mov|avi|mkv|m4v|ogv))\.audio\.ogg$", re.IGNORECASE
+)
+
+
+def is_audio_proxy(name: str) -> bool:
+    """True when `name` is the soundtrack extracted from a picked video."""
+    return bool(_PROXY_RE.search(name or ""))
+
+
+def proxy_source_name(name: str) -> str:
+    """The video's own file name that an audio proxy was made from."""
+    return _PROXY_RE.sub(r"\1", name or "")
 
 
 def post_media(api_url: str, media_id: str, name: str, source, ctype: str = ""):
