@@ -67,3 +67,29 @@ def test_fractional_core_uses_the_cheap_preset(monkeypatch):
 def test_full_core_keeps_the_quality_preset(monkeypatch):
     monkeypatch.setattr(renderer, "_cpu_quota", lambda: 4.0)
     assert "veryfast" in renderer._encoder_args("libx264")
+
+
+def test_the_vendored_quran_font_is_shipped():
+    # Without it the deploy host's DejaVu fallback renders Quranic marks as
+    # empty boxes (seen in a live rendered MP4).
+    assert os.path.isfile(renderer._VENDORED_FONT)
+
+
+def test_linux_uses_the_vendored_quran_font(monkeypatch):
+    monkeypatch.setattr(
+        renderer, "_find_font",
+        lambda family, bold: "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    )
+    name, opt = renderer._font_choice("Segoe UI", False)
+    assert name == "Amiri"
+    assert opt.startswith(":fontsdir=")
+
+
+def test_windows_keeps_the_system_font(monkeypatch):
+    monkeypatch.setattr(
+        renderer, "_find_font",
+        lambda family, bold: "C:\\Windows\\Fonts\\segoeui.ttf",
+    )
+    name, opt = renderer._font_choice("Segoe UI", False)
+    assert opt == ""
+    assert "segoeui" in name.lower()

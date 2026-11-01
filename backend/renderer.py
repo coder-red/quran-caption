@@ -16,6 +16,13 @@ FONT_FILES = {
 
 FONT_FALLBACK = ("C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf")
 
+# The deploy host has no Windows fonts and its DejaVu fallback has no Quranic
+# marks (U+06E1 …), so the burned-in Arabic came out as empty boxes. Amiri is
+# vendored (OFL) and registered with libass through fontsdir.
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_VENDORED_FONT = os.path.join(_FONTS_DIR, "Amiri-Regular.ttf")
+_VENDORED_FAMILY = "Amiri"
+
 DEFAULT_STYLES = {
     "font_size": 48,
     "font_family": "Segoe UI",
@@ -61,6 +68,14 @@ def _find_font(family: str, bold: bool) -> str:
     return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
+def _font_choice(family: str, bold: bool) -> tuple[str, str]:
+    """(FontName, extra subtitles-filter option) for the chosen family."""
+    path = _find_font(family, bold)
+    if os.path.isfile(_VENDORED_FONT) and not path.lower().startswith("c:\\windows"):
+        return _VENDORED_FAMILY, f":fontsdir={_filter_escape(_FONTS_DIR)}"
+    return _filter_escape(path), ""
+
+
 def _hex_to_ass(color_hex: str, alpha: int = 0) -> str:
     color = (color_hex or "#FFFFFF").lstrip("#")
     if len(color) == 3:
@@ -101,8 +116,9 @@ def inject_position(srt_content: str, position: str) -> str:
 
 def _build_vfilter(srt_path: str, styles: dict, scale_filter: str = "") -> str:
     filter_path = _filter_escape(srt_path)
-    font = _find_font(styles.get("font_family", "Segoe UI"), styles.get("bold", False))
-    font_escaped = _filter_escape(font)
+    font_name, font_dir_opt = _font_choice(
+        styles.get("font_family", "Segoe UI"), styles.get("bold", False)
+    )
 
     font_size = int(styles.get("font_size", 48))
     text_color = _hex_to_ass(styles.get("font_color", "#FFFFFF"))
@@ -121,13 +137,13 @@ def _build_vfilter(srt_path: str, styles: dict, scale_filter: str = "") -> str:
     alignment = 8 if position == "top" else (5 if position == "middle" else 2)
 
     style_opts = (
-        f"FontName={font_escaped},FontSize={font_size},"
+        f"FontName={font_name},FontSize={font_size},"
         f"PrimaryColour={text_color},OutlineColour={outline_color},"
         f"BackColour={back_color},BorderStyle={border_style},"
         f"Outline={outline},Shadow={shadow},Bold={1 if styles.get('bold') else 0},"
         f"Alignment={alignment}"
     )
-    vfilter = f"subtitles={filter_path}:force_style='{style_opts}'"
+    vfilter = f"subtitles={filter_path}{font_dir_opt}:force_style='{style_opts}'"
     if scale_filter:
         vfilter = f"{scale_filter},{vfilter}"
     return vfilter
