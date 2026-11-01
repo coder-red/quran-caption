@@ -89,6 +89,7 @@ def align_audio(
     height: int = Form(None),
     asr_backend: str = Form(None),
     job: int = Form(None),
+    key: str = Form(None),
 ):
     """Sync mode: returns the full result (legacy / simple clients). Job mode
     (job=1): returns {"job_id"} immediately, work runs in a background thread,
@@ -100,6 +101,13 @@ def align_audio(
     re-uploading the file — the server reuses its stored copy."""
     if job:
         _purge_old_align_jobs()
+        if key:
+            # Idempotent start: a client that lost the response (or was
+            # rerun mid-start) asks again with the same key.
+            with ALIGN_JOBS_LOCK:
+                existing = ALIGN_KEYS.get(key)
+                if existing in ALIGN_JOBS:
+                    return {"job_id": existing, "status": ALIGN_JOBS[existing]["status"]}
         if file is not None and getattr(file, "filename", None):
             content = file.file.read()
             filename = file.filename or "audio"
@@ -110,14 +118,22 @@ def align_audio(
         else:
             raise HTTPException(status_code=400, detail="Upload a file or pass media_id of an earlier /media upload")
         jid = uuid.uuid4().hex
-        ALIGN_JOBS[jid] = {
-            "status": "queued",
-            "progress": 0.0,
-            "stage": "queued",
-            "result": None,
-            "error": None,
-            "created": time.time(),
-        }
+        with ALIGN_JOBS_LOCK:
+            if key and key in ALIGN_KEYS:
+                existing = ALIGN_KEYS[key]
+                if existing in ALIGN_JOBS:
+                    return {"job_id": existing,
+                            "status": ALIGN_JOBS[existing]["status"]}
+            ALIGN_JOBS[jid] = {
+                "status": "queued",
+                "progress": 0.0,
+                "stage": "queued",
+                "result": None,
+                "error": None,
+                "created": time.time(),
+            }
+            if key:
+                ALIGN_KEYS[key] = jid
         threading.Thread(
             target=_align_job_worker,
             args=(jid, content, filename, media_path, duration, fps,
@@ -468,6 +484,10 @@ def _align_impl(
 
 ALIGN_JOBS: dict[str, dict] = {}
 ALIGN_JOBS_LOCK = threading.Lock()
+# Client-chosen key -> job id. A UI rerun while it is starting the job (any
+# widget change stops the Streamlit script) re-posts with the same key and
+# must get the SAME job instead of starting a duplicate or orphaning it.
+ALIGN_KEYS: dict[str, str] = {}
 
 # Only one align pipeline may run at a time. Every job is a daemon thread
 # with no other coordination, and the pipeline keeps process-wide state:
@@ -486,6 +506,9 @@ def _purge_old_align_jobs():
             job = ALIGN_JOBS[jid]
             if now - job.get("created", 0) > 24 * 3600:
                 del ALIGN_JOBS[jid]
+        for key, jid in list(ALIGN_KEYS.items()):
+            if jid not in ALIGN_JOBS:
+                del ALIGN_KEYS[key]
 
 
 class _JobUpload:

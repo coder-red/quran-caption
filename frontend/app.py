@@ -79,6 +79,137 @@ def source_video_name() -> str:
     return media_store.proxy_source_name(name) or name
 
 
+def poll_align_job(jid: str, status):
+    """Poll a running align job; the result dict, or None after an error.
+
+    Lives on the (job id) instead of a single script run: the burn-in video
+    landing mid-align stops the running script (Streamlit reruns on any
+    widget change), and without this the finished job was orphaned and the
+    page fell back to "Generate captions"."""
+    prog = st.progress(0, text="Queued…")
+    misses, started, last_pct = 0, time.time(), 0
+    while True:
+        time.sleep(0.8)
+        try:
+            job = requests.get(f"{API_URL}/align/status/{jid}", timeout=15).json()
+            misses = 0
+        except (requests.RequestException, ValueError):
+            misses += 1
+            elapsed = int(time.time() - started)
+            prog.progress(
+                last_pct, text=f"Reconnecting… ({misses}/5) · {elapsed}s elapsed",
+            )
+            if misses >= 5:
+                prog.empty()
+                status.update(label="Engine unreachable", state="error")
+                st.error(
+                    "Lost contact with the caption engine after "
+                    f"{elapsed}s (it may have crashed). Press Generate captions "
+                    "to retry once the engine is back up."
+                )
+                return None
+            continue
+        if not isinstance(job, dict) or "status" not in job:
+            prog.empty()
+            status.update(label="Job lost", state="error")
+            st.error(
+                "The engine no longer knows this align job (it may have "
+                "restarted). Press Generate captions to run it again."
+            )
+            return None
+        pct = job.get("progress", 0)
+        last_pct = min(99, int(pct))
+        prog.progress(
+            last_pct,
+            text=f"{job.get('stage', 'working…')} · {pct:.0f}% · "
+                 f"{int(time.time() - started)}s elapsed",
+        )
+        status.update(label=job.get("stage", "working…"))
+        if job.get("status") == "error":
+            # /align/status carries no message — fetch it from the result
+            # endpoint (now surfaces the real job error).
+            msg = None
+            try:
+                msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
+            except (requests.RequestException, ValueError):
+                msg = None
+            prog.empty()
+            status.update(label="Failed", state="error")
+            st.error(f"Align failed: {msg or 'unknown error'}")
+            return None
+        if job.get("status") == "done":
+            break
+    try:
+        data = requests.get(f"{API_URL}/align/result/{jid}", timeout=60).json()
+    except (requests.RequestException, ValueError) as e:
+        prog.empty()
+        status.update(label="Result fetch failed", state="error")
+        st.error(f"Could not fetch the result: {e}")
+        return None
+    if "error" in data:
+        prog.empty()
+        status.update(label="Failed", state="error")
+        st.error(f"Could not identify the surah: {data['error']}")
+        return None
+    prog.progress(100, text="Done · captions ready")
+    status.update(label="Surah detected — captions ready", state="complete")
+    return data
+
+
+def ensure_render_video(vfile) -> str | None:
+    """Put the picked video on the engine once; None on success.
+
+    The transfer is ~0.4 MB/s on the free host, so it starts as soon as the
+    file is picked (hidden uploader in step 1) instead of waiting for the
+    align to finish — otherwise the render step sits on it for minutes."""
+    if vfile is None:
+        return None
+    file_id = getattr(vfile, "file_id", None)
+    if (ss.get("video_uploaded") and ss.get("video_media_id")
+            and (ss.get("video_meta") or {}).get("file_id") == file_id):
+        return None
+    if ss.get("video_media_id") is None or (ss.get("video_meta") or {}).get("file_id") != file_id:
+        ss["video_media_id"] = uuid.uuid4().hex[:10]
+        ss["video_meta"] = {"name": vfile.name, "file_id": file_id}
+        ss["preview_video_uri"] = None
+        ss["preview_video_tried"] = False
+        ss["video_uploaded"] = False
+    try:
+        with st.spinner("Sending the original video to the engine…"):
+            up = post_media(ss["video_media_id"], vfile.name, vfile, vfile.type)
+    except requests.RequestException as e:
+        return f"Video upload failed: {e}"
+    if up.status_code != 200:
+        return f"Video upload failed: {api_error(up)}"
+    ss["video_uploaded"] = True
+    return None
+
+
+def video_prefetch() -> None:
+    """Hidden uploader that carries the burn-in video to the engine.
+
+    It must be rendered on EVERY script run: Streamlit drops the state of a
+    widget whose run does not render it, so skipping this block during the
+    blocking align or in the result view deleted the file mid-transfer and
+    the render step asked for the video all over again. The transfer also
+    starts here, in parallel with the align — it takes ~2 minutes on the
+    free host, longer than the align itself."""
+    if not (ss.get("media_id") and source_is_video()
+            and not ss.get("video_uploaded")):
+        return
+    with st.container(key=f"video_prefetch_{ss['media_id']}"):
+        pfile = st.file_uploader(
+            "Video for the burned-in MP4",
+            type=["mp4", "webm", "mov", "avi", "mkv"],
+            label_visibility="collapsed",
+            key=f"video_uploader_{ss['media_id']}",
+        )
+    if pfile is not None:
+        err = ensure_render_video(pfile)
+        if err:
+            st.caption(err + " You can pick the video again at the render step.")
+
+
 @st.cache_resource
 def _ensure_backend():
     """On Spaces: start the FastAPI child process. No model pre-downloads —
@@ -317,6 +448,11 @@ a.dl-btn {
 a.dl-btn:hover { filter: brightness(1.07); }
 a.dl-btn:active { transform: translateY(1px); }
 
+/* The burn-in video starts transferring the moment a clip is picked, so it
+   is already on the engine when the render step opens; the uploader itself
+   is filled by auto_proxy.js and has no reason to be on screen. */
+div[class*="st-key-video_prefetch"] { display: none !important; }
+
 /* ---------- Selectable chips ---------- */
 button[data-testid^="stBaseButton-segmented_control"],
 button[data-testid^="stBaseButton-pills"] {
@@ -475,6 +611,12 @@ ss = st.session_state
 ss.setdefault("file_bytes", None)
 ss.setdefault("file_meta", None)
 ss.setdefault("align_result", None)
+# An in-flight align. `align_key` is the idempotency key the engine started the
+# job under, `align_job_id` the job to poll; both survive reruns so a widget
+# change during the align (the burn-in video landing) resumes the job instead
+# of orphaning it.
+ss.setdefault("align_key", None)
+ss.setdefault("align_job_id", None)
 ss.setdefault("segments", None)
 ss.setdefault("lang", "ar")
 ss.setdefault("styles", dict(PRESETS["Classic"]))
@@ -1050,6 +1192,17 @@ def show_detection(result: dict):
             st.caption(f"Engine note — {result['engine_note']}")
 
 
+# ------------------------------------------------- The picture's own transfer
+# Rendered once, at a fixed spot outside every card and branch, so it exists
+# in EVERY script run at the same element-tree position — including the run
+# that blocks inside the align, and the result view that replaces step 1.
+# Streamlit drops the state of a widget a run does not render, and moving the
+# element between cards re-mounts the uploader and aborts the transfer in
+# flight (both were measured: the file was lost and the render step asked for
+# the video again). It has to start with the align, not after it: the transfer
+# takes ~2 minutes on the free host, longer than the align itself.
+video_prefetch()
+
 # ---------------------------------------------------------------- Step 1: upload
 if ss["align_result"] is None:
     with st.container(border=True, key="card_upload"):
@@ -1087,6 +1240,8 @@ if ss["align_result"] is None:
                 ss["file_bytes"] = uploaded.getvalue()
                 ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
                 ss["align_result"] = None
+                ss["align_key"] = None
+                ss["align_job_id"] = None
                 ss["segments"] = None
                 ss["sync_live"] = False
                 ss["sync_payload"] = None
@@ -1124,13 +1279,23 @@ if ss["align_result"] is None:
                 # is reused, so just offer Generate again (e.g. after a failure).
                 st.info("This file is already on the caption engine — generate captions, or pick another file.")
 
+            # Before the (blocking) align so its widget state survives the
+            # rerun the finished job triggers.
             generate = st.button(
                 "Generate captions", type="primary", width="stretch",
                 icon=":material/auto_awesome:",
             )
-            if generate:
+            # An align is a multi-minute job, and ANY widget change (e.g. the
+            # burn-in video landing mid-align) restarts this script. So the
+            # job lives in session state: `align_key` makes the start
+            # idempotent (the engine returns the job it already started) and
+            # `align_job_id` resumes polling after a rerun.
+            if generate and not ss.get("align_key"):
                 if not ss.get("media_id"):
                     ss["media_id"] = uuid.uuid4().hex[:10]
+                ss["align_key"] = uuid.uuid4().hex
+
+            if ss.get("align_key"):
                 with st.status("Running speech recognition + surah detection…", expanded=False) as status:
                     try:
                         # Upload ONCE: the file goes to /media, then /align
@@ -1141,6 +1306,7 @@ if ss["align_result"] is None:
                             payload = media_bytes()
                             if payload is None:
                                 st.error("Upload failed: file bytes unavailable — re-select the file.")
+                                ss["align_key"] = None
                                 st.stop()
                             up = post_media(
                                 ss["media_id"], ss["file_meta"]["name"], payload,
@@ -1148,94 +1314,44 @@ if ss["align_result"] is None:
                             )
                             if up.status_code != 200:
                                 st.error(f"Upload failed: {api_error(up)}")
+                                ss["align_key"] = None
                                 st.stop()
                             ss["media_uploaded"] = True
                             drop_media_bytes()
-                        resp = requests.post(
-                            f"{API_URL}/align",
-                            # Engine is chosen server-side (ASR_BACKEND env) —
-                            # no UI override, so the form field is omitted.
-                            data={"job": "1", "media_id": ss["media_id"]},
-                            timeout=120,
-                        )
+                        if not ss.get("align_job_id"):
+                            resp = requests.post(
+                                f"{API_URL}/align",
+                                # Engine is chosen server-side (ASR_BACKEND env)
+                                # — no UI override, so that field is omitted.
+                                data={"job": "1", "media_id": ss["media_id"],
+                                      "key": ss["align_key"]},
+                                timeout=120,
+                            )
+                            if resp.status_code != 200:
+                                st.error(f"API error {resp.status_code}: {api_error(resp)}")
+                                ss["align_key"] = None
+                                st.stop()
+                            ss["align_job_id"] = resp.json()["job_id"]
                     except requests.RequestException as e:
                         st.error(f"Could not reach the caption engine: {e}")
+                        ss["align_key"] = None
                         st.stop()
-                    if resp.status_code != 200:
-                        st.error(f"API error {resp.status_code}: {api_error(resp)}")
-                        st.stop()
-                    jid = resp.json()["job_id"]
-                    prog = st.progress(0, text="Queued…")
-                    # A dead engine used to spin here forever (every poll
-                    # raised RequestException -> continue) behind a frozen
-                    # bar. Count consecutive misses and bail out with a real
-                    # message instead.
-                    misses, started, last_pct = 0, time.time(), 0
-                    while True:
-                        time.sleep(0.8)
-                        try:
-                            job = requests.get(f"{API_URL}/align/status/{jid}", timeout=15).json()
-                            misses = 0
-                        except (requests.RequestException, ValueError):
-                            misses += 1
-                            elapsed = int(time.time() - started)
-                            prog.progress(
-                                last_pct,
-                                text=f"Reconnecting… ({misses}/5) · {elapsed}s elapsed",
-                            )
-                            if misses >= 5:
-                                prog.empty()
-                                status.update(label="Engine unreachable", state="error")
-                                st.error(
-                                    "Lost contact with the caption engine after "
-                                    f"{elapsed}s (it may have crashed). Press "
-                                    "Generate captions to retry once the engine "
-                                    "is back up."
-                                )
-                                st.stop()
-                            continue
-                        pct = job.get("progress", 0)
-                        last_pct = min(99, int(pct))
-                        prog.progress(
-                            last_pct,
-                            text=f"{job.get('stage', 'working…')} · {pct:.0f}% · "
-                                 f"{int(time.time() - started)}s elapsed",
-                        )
-                        status.update(label=job.get("stage", "working…"))
-                        if job.get("status") == "error":
-                            # /align/status carries no message — fetch it from
-                            # the result endpoint (now surfaces the real job
-                            # error).
-                            msg = None
-                            try:
-                                msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
-                            except (requests.RequestException, ValueError):
-                                msg = None
-                            prog.empty()
-                            status.update(label="Failed", state="error")
-                            st.error(f"Align failed: {msg or 'unknown error'}")
-                            st.stop()
-                        if job.get("status") == "done":
-                            break
-                    try:
-                        data = requests.get(f"{API_URL}/align/result/{jid}", timeout=60).json()
-                    except requests.RequestException as e:
-                        st.error(f"Could not fetch the result: {e}")
-                        st.stop()
-                    if "error" in data:
-                        st.error(f"Could not identify the surah: {data['error']}")
-                        st.stop()
-                    ss["align_result"] = data
-                    ss["segments"] = [dict(s) for s in data["segments"]]
-                    # A new align means new evidence: drop the old inspector payload.
-                    ss["sync_live"] = False
-                    ss["sync_payload"] = None
-                    ss["sync_sig"] = None
-                    prog.progress(100, text="Done · captions ready")
-                    status.update(label="Surah detected — captions ready", state="complete")
+                    data = poll_align_job(ss["align_job_id"], status)
+                ss["align_job_id"] = None
+                ss["align_key"] = None
+                if data is None:
+                    st.stop()
+                ss["align_result"] = data
+                ss["segments"] = [dict(s) for s in data["segments"]]
+                # A new align means new evidence: drop the old inspector payload.
+                ss["sync_live"] = False
+                ss["sync_payload"] = None
+                ss["sync_sig"] = None
                 # The upload card belongs to the pre-align state; rerun so the
                 # result view replaces it instead of stacking below it.
                 st.rerun()
+
+
 
 # ---------------------------------------------------------------- Step 2: preview & style
 if ss["align_result"] is not None and ss["segments"]:
@@ -1387,56 +1503,60 @@ if ss["align_result"] is not None and ss["segments"]:
             (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
         )
         _from_video = source_is_video()
+        _vup = bool(ss.get("video_uploaded"))
         if _audio_only:
             if _from_video:
-                if not ss.get("video_uploaded"):
+                # The transfer itself is owned by the top-level prefetch
+                # uploader (it outlives the step cards); here only its state
+                # is shown, plus a manual fallback with its own widget key.
+                if _vup:
+                    st.caption(f"Video: {source_video_name()}")
+                    st.success("Original video uploaded — ready to render.")
+                else:
                     st.info(
                         "Sending your video to the caption engine in the background. "
                         "You can keep editing — rendering unlocks as soon as it lands."
                     )
-                else:
-                    st.caption(f"Video: {source_video_name()}")
+                    _vfile = st.file_uploader(
+                        "If the transfer stalled, pick the video file again",
+                        type=["mp4", "webm", "mov", "avi", "mkv"],
+                        label_visibility="collapsed",
+                        key=f"video_uploader_fallback_{ss['media_id']}",
+                    )
+                    if _vfile is not None:
+                        _verr = ensure_render_video(_vfile)
+                        if _verr:
+                            st.error(_verr)
+                        else:
+                            st.rerun()
             else:
                 st.caption("The video the captions are burned into.")
-            # The uploader is only rendered until the video is on the engine:
-            # Streamlit keeps every uploaded file in memory (BytesIO) for as
-            # long as its widget exists, and a 40MB+ video held for the rest
-            # of the session is part of what OOM-killed the 512MB host.
-            if not ss.get("video_uploaded"):
-                _vfile = st.file_uploader(
-                    "Video for the burned-in MP4",
-                    type=["mp4", "webm", "mov", "avi", "mkv"],
-                    label_visibility="collapsed",
-                    # A new clip gets a fresh widget, so the previous clip's video
-                    # can never be rendered under the new captions.
-                    key=f"video_uploader_{ss['media_id']}",
-                )
-                if _vfile is not None:
-                    if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
-                        ss["video_media_id"] = uuid.uuid4().hex[:10]
-                        ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
-                        ss["preview_video_uri"] = None
-                        ss["preview_video_tried"] = False
-                    try:
-                        with st.spinner("Uploading the original video…"):
-                            up = post_media(
-                                ss["video_media_id"], _vfile.name, _vfile, _vfile.type
-                            )
-                        if up.status_code != 200:
-                            st.error(f"Video upload failed: {api_error(up)}")
+                # The uploader is only rendered until the video is on the
+                # engine: Streamlit keeps every uploaded file in memory
+                # (BytesIO) for as long as its widget exists, and a 40MB+
+                # video held for the rest of the session is part of what
+                # OOM-killed the 512MB host.
+                if not _vup:
+                    _vfile = st.file_uploader(
+                        "Video for the burned-in MP4",
+                        type=["mp4", "webm", "mov", "avi", "mkv"],
+                        label_visibility="collapsed",
+                        # A new clip gets a fresh widget, so the previous
+                        # clip's video can never be rendered under the new
+                        # captions.
+                        key=f"video_uploader_{ss['media_id']}",
+                    )
+                    if _vfile is not None:
+                        _verr = ensure_render_video(_vfile)
+                        if _verr:
+                            st.error(_verr)
                         else:
-                            ss["video_uploaded"] = True
                             # Drop the uploader (and with it the in-memory
                             # file) and swap the preview to the real picture.
                             st.rerun()
-                    except requests.RequestException as e:
-                        st.error(f"Video upload failed: {e}")
-                if _from_video:
-                    st.caption("If the automatic transfer stalled, pick the video file again above.")
-                else:
                     st.caption("Captions are burned into a picture — add the video to use.")
-            else:
-                st.success("Original video uploaded — ready to render.")
+                else:
+                    st.success("Original video uploaded — ready to render.")
 
         # Without the picture there is nothing to burn into, so the render
         # stays locked instead of failing in FFmpeg (it needs a video stream).
