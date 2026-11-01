@@ -287,6 +287,12 @@ def _trim_texts(text_ar: str, text_en: str,
     if en_words and len(en_words) != ar_total:
         f = round(first * len(en_words) / ar_total)
         l = round(last * len(en_words) / ar_total)
+    else:
+        f, l = first, last
+    if en_words:
+        # A clipped translation must not stop mid-phrase; keep the whole
+        # clause (comma/period bounded) the recited range sits in.
+        f, l = _en_clause_span(en_words, f, l)
         en = en_words[f:l]
     else:
         en = en_words[first:last]
@@ -393,9 +399,10 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
     list means the audio is truly continuous (VAD found no pause), so nothing
     splits; only None (no audio data, e.g. tests) falls back to the Whisper
     word gap as weak evidence. Canon text is re-sliced to each phrase by
-    word-count proportion (recitation order == text order); English uses the
-    same proportional cuts, snapped to the nearest sentence break so
-    translations don't split mid-sentence. canon_pos (provider path) replaces
+    word-count proportion (recitation order == text order); English is cut
+    into contiguous natural chunks (punctuation when near, otherwise before a
+    function word) so a phrase never ends on a dangling "the"/"of"/"and".
+    canon_pos (provider path) replaces
     the proportional cut with the exact canon span each phrase recites, so a
     REPEATED passage cannot shift the text ahead of the voice. raw_segs: raw
     (unmerged) VAD speech segments — when given (provider path), each
@@ -498,6 +505,14 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
         k = int(seq_len * (hi + 1) / total)
         return max(0, min(seq_len, k))
 
+    # English phrase text: contiguous natural chunks, one per phrase, sized by
+    # the Arabic word count of the phrase it translates. Every translation
+    # word is shown exactly once and each phrase advances through the sentence
+    # (clause-complete slices repeated a long sentence over several phrases).
+    en_regions: list[tuple[int, int]] | None = None
+    if n_en:
+        en_regions = _en_chunks(en_words, [hi - lo + 1 for lo, hi in regions])
+
     # Repeat-proof text spans: cut each phrase's display text at the canon
     # words it actually recites. A repeated passage makes the ASR word count
     # exceed the canon word count, so proportional cutting shifts every later
@@ -532,40 +547,31 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
 
     out = []
     prev_b_ar = 0
-    prev_b_en = 0
     for idx, (lo, hi) in enumerate(regions):
         last = idx == n_regions - 1
         if spans is not None:
             a_ar, b_ar = spans[idx]
-            a_en = (round(a_ar * n_en / n_ar) if n_en else 0)
-            b_en = (round(b_ar * n_en / n_ar) if n_en else 0)
-            if n_en and b_en <= a_en:
-                b_en = min(a_en + 1, n_en)
-            prev_b_ar, prev_b_en = b_ar, b_en
+            prev_b_ar = b_ar
         else:
-            # Reserve one word per remaining phrase so no phrase is starved:
-            # the proportional cut must never consume words a later phrase
-            # still needs.
             regions_left = n_regions - idx - 1
             if last:
-                # Last phrase takes EVERYTHING left in both languages, so the
-                # tail of the ayah can never lose its text (this was the
-                # "English did not show" bug: the final 1-2 Arabic words were
-                # emitted with an empty English slice because the proportional
-                # EN cut had already been consumed by the previous phrase).
-                b_ar, b_en = n_ar, n_en
+                # Last phrase takes EVERYTHING left in Arabic, so the tail of
+                # the ayah can never lose its text (this was the "English did
+                # not show" bug: the final 1-2 Arabic words were emitted with
+                # an empty English slice because the proportional EN cut had
+                # already been consumed by the previous phrase).
+                b_ar = n_ar
             else:
                 b_ar = min(cut(n_ar, hi), n_ar - regions_left)
-                b_en_plain = cut(n_en, hi)
-                b_en = _snap_en_boundary(en_words, prev_b_en, b_en_plain)
-                b_en = min(b_en, n_en - regions_left)
-            a_ar, a_en = prev_b_ar, prev_b_en
+            a_ar = prev_b_ar
             # Never emit a phrase with a language it still has words for.
             if n_ar and b_ar <= a_ar:
                 b_ar = min(a_ar + 1, n_ar)
-            if n_en and b_en <= a_en:
-                b_en = min(a_en + 1, n_en)
-            prev_b_ar, prev_b_en = b_ar, b_en
+            prev_b_ar = b_ar
+        if en_regions:
+            a_en, b_en = _chunk_at(en_regions, idx, n_regions)
+        else:
+            a_en = b_en = 0
         phrase = dict(seg)
         pstart = round(float(ws[lo]["start"]), 3)
         pend = round(float(ws[hi]["end"]), 3)
@@ -591,17 +597,143 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
     return out
 
 
-def _snap_en_boundary(en_words: list[str], a: int, b: int) -> int:
-    """Nudge an English proportional cut to the nearest word ending a sentence
-    (., !, ?) within a small window, so phrases split at sentence breaks."""
-    if b <= a + 1 or b >= len(en_words):
-        return b
-    lo, hi = max(a + 1, b - 3), min(len(en_words), b + 3)
-    for j in range(lo, hi + 1):
-        prev = en_words[j - 1].rstrip('"')
-        if prev and prev[-1] in _EN_BREAK_CHARS:
-            return j
-    return b
+def _ends_clause(word: str) -> bool:
+    w = (word or "").rstrip("\"'”’)]")
+    if not w:
+        return False
+    if w[-1] in _EN_BREAK_CHARS:
+        return True
+    # A standalone dash separates clauses in this translation (701 ayahs:
+    # "... from the people of the towns - it is for Allah ...").
+    return set(w) <= {"-", "\u2013", "\u2014"}
+
+
+# Words a caption must never END on: the screen would read as cut off
+# ("It is He who expelled the", "but [the decree of]", "Allah came and").
+_EN_DANGLING = set(
+    "a an the of to in on at by for from with into onto upon among between "
+    "through during without within about against over under above below as "
+    "than and or nor but so yet who whom whose which that what when where "
+    "while because if though although since until its his her their our your "
+    "my this these those there here he she it they we you i him them us me "
+    "one every each any some such no".split()
+)
+# Copulas/auxiliaries: weak endings, used only when nothing better is near.
+_EN_LIGHT = set(
+    "is are was were be been being am has have had will would shall should "
+    "can could may might must do does did not".split()
+)
+# Words that read naturally at the START of a caption chunk.
+_EN_OPENERS = set(
+    "and but so then because when while who which that for from among at in "
+    "with on to of by as if".split()
+)
+
+
+def _en_chunk_cost(en_words: list[str], b: int, raw: float,
+                   start: int = 0) -> float:
+    """Cost of ending an English chunk after word b-1 (0 < b < n)."""
+    prev = (en_words[b - 1] or "").strip("[]()\"'“”‘’").lower()
+    cost = abs(b - raw) * 6.0
+    if _ends_clause(en_words[b - 1]):
+        cost -= 9.0
+    if prev in _EN_DANGLING:
+        cost += 100.0
+    elif prev in _EN_LIGHT:
+        cost += 6.0
+    nxt = (en_words[b] or "").strip("[]()\"'“”‘’").lower()
+    if nxt in _EN_OPENERS:
+        cost -= 3.0
+    if b - start < 2:      # a one-word chunk ("came") reads as a glitch
+        cost += 7.0
+    if len(en_words) - b < 2:
+        cost += 4.0
+    depth = sum(w.count("[") - w.count("]") for w in en_words[:b])
+    if depth:      # "[the decree of]" is one unit — never cut inside it
+        cost += 1000.0
+    return cost
+
+
+def _en_chunks(en_words: list[str],
+               weights: list[int]) -> list[tuple[int, int]]:
+    """Split English words into contiguous chunks, one per weight.
+
+    weights are the Arabic word counts of the cues/phrases the chunks are
+    shown by, so the translation advances with the recitation instead of
+    holding one long clause over several cues. Each cut lands at a natural
+    boundary: punctuation when one is near, otherwise right before a function
+    word, so no chunk ends on a dangling "the"/"of"/"and". Chunks are
+    contiguous and complete (the last one takes the tail), so every English
+    word is shown exactly once. len(weights) > len(en_words) (a one-word
+    translation over several cues) returns one chunk per word; the caller
+    repeats the nearest chunk."""
+    n = len(en_words)
+    k = len(weights)
+    if not n or not k:
+        return []
+    if k > n:
+        return [(i, i + 1) for i in range(n)]
+    ws = [max(1, int(w)) for w in weights]
+    total = sum(ws)
+    bounds = [0]
+    accum = 0
+    window = max(3, n // k)
+    for i, w in enumerate(ws[:-1]):
+        accum += w
+        raw = accum * n / total
+        lo = max(bounds[-1] + 1, int(raw) - window)
+        hi = min(n - (k - 1 - i), int(raw) + window)
+        best = None
+        for b in range(lo, hi + 1):
+            c = _en_chunk_cost(en_words, b, raw, bounds[-1])
+            if best is None or c < best[0]:
+                best = (c, b)
+        if best is None:
+            b = max(bounds[-1] + 1, min(int(round(raw)), n - (k - 1 - i)))
+        else:
+            b = best[1]
+        bounds.append(b)
+    bounds.append(n)
+    chunks = list(zip(bounds, bounds[1:]))
+    # A one-word chunk ("came") reads as a glitch on screen: that cue holds the
+    # phrase just said instead (the voice is still finishing it). The chunk
+    # count stays equal to the cue count so every other cue keeps its slice.
+    for i in range(1, len(chunks)):
+        a, b = chunks[i]
+        if b - a == 1 and chunks[i - 1][1] - chunks[i - 1][0] <= 10:
+            chunks[i] = chunks[i - 1]
+    return chunks
+
+
+def _chunk_at(chunks: list[tuple[int, int]],
+              i: int, k: int) -> tuple[int, int]:
+    """The chunk shown by item i of k when there are fewer chunks than items
+    (a short translation over several cues repeats the nearest chunk)."""
+    if not chunks:
+        return 0, 0
+    if len(chunks) == k:
+        return chunks[i]
+    return chunks[min(len(chunks) - 1, int(i * len(chunks) / k))]
+
+
+def _en_clause_span(en_words: list[str], a: int, b: int) -> tuple[int, int]:
+    """Expand a clipped English range to the whole clause(s) it touches.
+
+    Used when the display text is clipped to a mid-ayah recitation range: an
+    English sentence cannot start or stop mid-clause, so a clip edge is pulled
+    to the nearest punctuation (comma / semicolon / colon / period / dash)."""
+    n = len(en_words)
+    if not n:
+        return 0, 0
+    a = max(0, min(int(a), n - 1))
+    b = max(a + 1, min(int(b), n))
+    s = a
+    while s > 0 and not _ends_clause(en_words[s - 1]):
+        s -= 1
+    e = b
+    while e < n and not _ends_clause(en_words[e - 1]):
+        e += 1
+    return s, e
 
 
 def split_segments_at_pauses(
@@ -1047,26 +1179,16 @@ def _word_cues(seg: dict, ws: list[dict], silence_runs: list | None = None,
     bounds.append(n_ar)
 
     cues: list[dict] = []
-    prev_en = 0
     last_gi = len(groups) - 1
+    # English: one contiguous natural chunk per cue, sized by the cue's own
+    # Arabic words, so the translation advances with the recitation and still
+    # never stops on a dangling "the"/"of"/"and".
+    en_chunks = (_en_chunks(en_words, [bounds[i + 1] - bounds[i]
+                                       for i in range(len(groups))])
+                 if n_en else [])
     for gi, g in enumerate(groups):
         a_ar, b_ar = bounds[gi], bounds[gi + 1]
-        if n_en:
-            a_en = prev_en
-            if gi == last_gi:
-                b_en = n_en
-            else:
-                left = last_gi - gi
-                b_en = round(b_ar * n_en / n_ar)
-                b_en = _snap_en_boundary(en_words, a_en, b_en)
-                # Never eat an English word a later cue still needs: the snap
-                # can run forward to the ayah's closing period and leave every
-                # cue after it with Arabic but no translation (measured: 14).
-                b_en = min(b_en, n_en - left)
-                b_en = max(b_en, min(a_en + 1, n_en))
-            prev_en = b_en
-        else:
-            a_en = b_en = 0
+        a_en, b_en = _chunk_at(en_chunks, gi, len(groups))
         start = float(ws[g[0]]["start"])
         if gi == 0:
             start = min(start, float(seg["start"]))
@@ -1514,6 +1636,79 @@ def _qud_retag_leading_opener(base: list[tuple[dict, list[dict]]]) -> None:
         return
 
 
+def _find_canon_seq(canon: list[str], words: list[str]) -> int | None:
+    """First index where `words` occur in `canon` (a repeat restarts there)."""
+    n = len(words)
+    if not n:
+        return None
+    for i in range(len(canon) - n + 1):
+        if canon[i:i + n] == words:
+            return i
+    return None
+
+
+def _qud_cue_english(segments: list[dict], texts_ar: dict,
+                     texts_en: dict) -> None:
+    """Assign each cue its own slice of the ayah translation, once, at the
+    final cue granularity.
+
+    QUD knows exactly which canon words each cue recites, so the cues of an
+    ayah are located in canon (a repeat restarts at its own words) and the
+    ayah's English is split across them with `_en_chunks`: contiguous, in
+    order, complete, and cut at natural boundaries. Doing this at the cue
+    level (not per phrase, then again per cue) is what keeps a breath-split
+    piece from ending the translation on a bare "He"/"the" — the cut can move
+    across the whole sentence instead of within one phrase slice. Runs of
+    cues that do NOT continue in canon (a repeat) start their translation
+    over, which is what the reciter is doing."""
+    runs: list[tuple[tuple[int, int], list[tuple[dict, int, int]]]] = []
+    key = None
+    canon: list[str] = []
+    cursor = 0
+    for cue in segments:
+        words = (cue.get("text_ar") or "").split()
+        surah, ayah = int(cue.get("surah") or 0), int(cue.get("ayah") or 0)
+        if not words or surah < 1 or ayah < 1:
+            key = None
+            continue
+        k = (surah, ayah)
+        if k != key:
+            canon = (texts_ar.get(f"{surah}:{ayah}") or "").split()
+            cursor = 0
+            key = k
+        a = cursor
+        if canon[a:a + len(words)] != words:
+            a = _find_canon_seq(canon, words)
+            if a is None:      # opener text living outside the ayah's canon
+                key = None
+                continue
+        b = a + len(words)
+        if runs and runs[-1][0] == k and runs[-1][1][-1][2] == a:
+            runs[-1][1].append((cue, a, b))
+        else:
+            runs.append((k, [(cue, a, b)]))
+        cursor = b
+
+    for (surah, ayah), items in runs:
+        en_words = (texts_en.get(f"{surah}:{ayah}") or "").split()
+        n_ar = len((texts_ar.get(f"{surah}:{ayah}") or "").split())
+        if not en_words or not n_ar:
+            continue
+        first, last = items[0][1], items[-1][2]
+        f = min(round(first * len(en_words) / n_ar), len(en_words) - 1)
+        l = max(f + 1, round(last * len(en_words) / n_ar))
+        # The run's outer edges keep whole clauses (a clip that starts
+        # mid-ayah must not start its translation mid-sentence).
+        f = min(_en_clause_span(en_words, f, f + 1)[0], l - 1)
+        l = _en_clause_span(en_words, max(f, l - 1), l)[1]
+        sub = en_words[f:l]
+        chunks = _en_chunks(
+            sub, [len((c.get("text_ar") or "").split()) for c, _, _ in items])
+        for i, (cue, _a, _b) in enumerate(items):
+            ca, cb = _chunk_at(chunks, i, len(items))
+            cue["text_en"] = " ".join(sub[ca:cb])
+
+
 def _qud_trim_silence_overhang(segments: list[dict], silence_runs) -> list[dict]:
     """Cut a cue back to the silence onset when its end reaches past a measured
     breath. QUD's word durations can absorb the trailing pause into the last
@@ -1607,6 +1802,7 @@ def segments_from_qud_alignment(
     segments.sort(key=lambda s: s["start"])
     segments = subdivide_word_cues(
         segments, words_out, silence_runs, raw_segs, trust_times=True)
+    _qud_cue_english(segments, texts_ar, texts_en)
     # A caption blanks for a BREATH, not for every 0.2-0.4 s articulation dip:
     # a 0.38 s VAD dip inside a QUD word pulled the cue end back and left
     # 1.18 s of recited "أَنَّهُم" with no caption (real Al-Hashr at 40.1 s).

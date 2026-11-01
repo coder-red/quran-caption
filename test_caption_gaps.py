@@ -25,8 +25,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backend.segmenter import (
+    _en_clause_span,
+    _ends_clause,
     _phrase_split,
-    _snap_en_boundary,
     apply_sync_padding,
 )
 
@@ -62,17 +63,21 @@ def _assert_no_empty_language(phrases, need_en=True, need_ar=True):
                 f"phrase {p['start']}-{p['end']} has EMPTY english text")
 
 
-def test_english_never_empty_when_sentence_snap_walks_back():
-    """Regression for the reproduced slice=[5:5] empty-English case."""
+def test_english_slice_is_never_empty_or_mid_clause():
+    """Regression for the empty-English case AND for chopped translations.
+
+    Every cue/phrase English range is expanded to the clause(s) it touches:
+    the result must be non-empty, must cover the range it came from, and must
+    end at a clause boundary (comma/period) or at the end of the ayah."""
     en_words = EN_LONG.split()
     n_en = len(en_words)
-    for a in range(0, n_en + 1):
-        for b in range(a, n_en + 1):
-            snapped = _snap_en_boundary(en_words, a, b)
-            # The snap must never move the cut to or behind the previous one.
-            assert snapped > a or b == a, (
-                f"snap returned {snapped} for prev={a} plain={b} (n_en={n_en}) "
-                "-> empty english slice")
+    for a in range(n_en):
+        for b in range(a + 1, n_en + 1):
+            s, e = _en_clause_span(en_words, a, b)
+            assert e > s, f"empty english slice for [{a}:{b}]"
+            assert s <= a and e >= b, f"span shrank for [{a}:{b}] -> [{s}:{e}]"
+            assert e == n_en or _ends_clause(en_words[e - 1]), (
+                f"slice [{s}:{e}] ends mid-clause at {en_words[e - 1]!r}")
 
 
 def test_phrase_split_yields_no_empty_english_phrase():

@@ -9,6 +9,7 @@ so the text on screen is the words being recited.
 import pytest
 
 from backend.segmenter import (
+    _EN_DANGLING,
     MIN_GAP,
     WORD_CUE_GAP,
     WORD_CUE_WORDS,
@@ -153,18 +154,34 @@ def test_misheard_word_between_two_phrases_is_not_dropped_from_the_text():
     assert shown == canon.split()
 
 
-def test_every_cue_keeps_its_english_when_the_snap_hits_the_final_period():
-    """The English cut is snapped forward to a sentence break; without a
-    reservation that snap can jump to the ayah's closing period and leave
-    every later cue with Arabic but no translation (measured: 14 cues)."""
+def test_every_cue_keeps_its_english_and_never_ends_mid_word():
+    """English was sliced proportionally to the Arabic word count, so cues
+    ended on fragments ("It is He who expelled the", "You did not"). Each cue
+    now shows its own contiguous chunk of the translation, cut at a natural
+    boundary (punctuation, else before a function word): concatenating the
+    cues gives the whole translation word for word, no cue is left with
+    Arabic but no English, and no multi-word cue stops on a dangling "the"."""
     key = "59:5"
     en = load_english_texts()[key]
+    en_words = en.split()
     words = _ayah_words(key, len(load_ayah_texts()[key].split()))
     seg = _seg(key, words)
     seg["text_en"] = en
     cues = apply_sync_padding(_word_cues(seg, words), silence_runs=[])
+
     assert all(c["text_en"].strip() for c in cues), cues
-    assert " ".join(c["text_en"] for c in cues).split() == en.split()
+    # contiguous and complete: every translation word shown exactly once
+    assert " ".join(c["text_en"] for c in cues).split() == en_words, cues
+    for c in cues:
+        shown = c["text_en"].split()
+        if len(shown) > 1:
+            last = shown[-1].strip("[]()\"'“”‘’").lower()
+            assert last not in _EN_DANGLING, (
+                f"cue {c['start']}-{c['end']} stops on {shown[-1]!r}: "
+                f"{c['text_en']!r}")
+    # the first cue starts the ayah's translation; the last cue reaches its end
+    assert cues[0]["text_en"].startswith(en_words[0])
+    assert cues[-1]["text_en"].endswith(en_words[-1])
 
 
 def test_vocative_hole_words_join_the_ayah_they_open():

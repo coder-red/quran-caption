@@ -65,7 +65,9 @@ def test_pause_cuts_into_two_phrases():
     assert "الَّذِينَ" in out[0]["text_ar"]
     assert out[0]["text_ar"].startswith("يَا")
     assert "وَرَسُولِهِ" in out[1]["text_ar"]
-    # English snapped to the comma after "believed", not mid-clause
+    # English advances phrase by phrase in contiguous natural chunks: phrase 1
+    # takes the opening clause (up to the comma), phrase 2 the rest — never a
+    # fragment like "do not put forward before".
     assert out[0]["text_en"] == "O you who have believed,"
     assert out[1]["text_en"] == ("do not put forward before Allah and "
                                  "His Messenger")

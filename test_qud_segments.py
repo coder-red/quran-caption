@@ -104,6 +104,24 @@ def test_repeat_is_captioned_twice_in_recitation_order():
     assert _joined(late) == canon[8:11]
 
 
+def test_split_pieces_of_one_ayah_advance_through_its_translation():
+    """QUD splits one ayah into several segments at a pause. Each piece used
+    to show the whole clause its first word fell in, so consecutive cues
+    repeated the same translation; the pieces must instead split the ayah's
+    English between them, in order and complete."""
+    en = load_english_texts()["59:2"].split()
+    first = _qseg(59, 2, 1, 3, t0=10.0)
+    rest = _qseg(59, 2, 4, 6, t0=13.0)
+    segments, _ = segments_from_qud_alignment([first, rest], [], [])
+    a = [c for c in segments if c["start"] < 12.9]
+    b = [c for c in segments if c["start"] >= 12.9]
+    assert a and b
+    shown = " ".join(c["text_en"] for c in a + b).split()
+    assert shown == en[:len(shown)], shown
+    # the second piece adds words instead of repeating the first clause
+    assert len(" ".join(c["text_en"] for c in b).split()) >= 4
+
+
 def test_basmala_special_displays_1_1():
     canon = load_ayah_texts()["1:1"]
     qs = {
