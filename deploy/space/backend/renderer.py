@@ -16,6 +16,13 @@ FONT_FILES = {
 
 FONT_FALLBACK = ("C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf")
 
+# The deploy host has no Windows fonts and its DejaVu fallback has no Quranic
+# marks (U+06E1 …), so the burned-in Arabic came out as empty boxes. Amiri is
+# vendored (OFL) and registered with libass through fontsdir.
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_VENDORED_FONT = os.path.join(_FONTS_DIR, "Amiri-Regular.ttf")
+_VENDORED_FAMILY = "Amiri"
+
 DEFAULT_STYLES = {
     "font_size": 48,
     "font_family": "Segoe UI",
@@ -61,6 +68,14 @@ def _find_font(family: str, bold: bool) -> str:
     return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
+def _font_choice(family: str, bold: bool) -> tuple[str, str]:
+    """(FontName, extra subtitles-filter option) for the chosen family."""
+    path = _find_font(family, bold)
+    if os.path.isfile(_VENDORED_FONT) and not path.lower().startswith("c:\\windows"):
+        return _VENDORED_FAMILY, f":fontsdir={_filter_escape(_FONTS_DIR)}"
+    return _filter_escape(path), ""
+
+
 def _hex_to_ass(color_hex: str, alpha: int = 0) -> str:
     color = (color_hex or "#FFFFFF").lstrip("#")
     if len(color) == 3:
@@ -101,8 +116,9 @@ def inject_position(srt_content: str, position: str) -> str:
 
 def _build_vfilter(srt_path: str, styles: dict, scale_filter: str = "") -> str:
     filter_path = _filter_escape(srt_path)
-    font = _find_font(styles.get("font_family", "Segoe UI"), styles.get("bold", False))
-    font_escaped = _filter_escape(font)
+    font_name, font_dir_opt = _font_choice(
+        styles.get("font_family", "Segoe UI"), styles.get("bold", False)
+    )
 
     font_size = int(styles.get("font_size", 48))
     text_color = _hex_to_ass(styles.get("font_color", "#FFFFFF"))
@@ -121,13 +137,13 @@ def _build_vfilter(srt_path: str, styles: dict, scale_filter: str = "") -> str:
     alignment = 8 if position == "top" else (5 if position == "middle" else 2)
 
     style_opts = (
-        f"FontName={font_escaped},FontSize={font_size},"
+        f"FontName={font_name},FontSize={font_size},"
         f"PrimaryColour={text_color},OutlineColour={outline_color},"
         f"BackColour={back_color},BorderStyle={border_style},"
         f"Outline={outline},Shadow={shadow},Bold={1 if styles.get('bold') else 0},"
         f"Alignment={alignment}"
     )
-    vfilter = f"subtitles={filter_path}:force_style='{style_opts}'"
+    vfilter = f"subtitles={filter_path}{font_dir_opt}:force_style='{style_opts}'"
     if scale_filter:
         vfilter = f"{scale_filter},{vfilter}"
     return vfilter
@@ -140,11 +156,69 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
+RENDER_MAX_HEIGHT = 720
+
+
+def _clamp_resolution(width: int | None, height: int | None,
+                      video_path: str | None = None
+                      ) -> tuple[int | None, int | None]:
+    """Keep x264 inside the free host's 512MB.
+
+    Measured on the real 8-min Al-Hashr clip: 1080p veryfast peaks at 327MB
+    RSS, 720p ultrafast at 88MB. On a fractional-core container the extra
+    frame memory plus the base processes is what trips the OOM killer, and a
+    720p source could only be upscaled anyway. "Original" (no explicit size)
+    is clamped too, after probing the source — most phone videos are 1080p."""
+    if _cpu_quota() >= 1.0:
+        return width, height
+    if width and height:
+        if int(height) > RENDER_MAX_HEIGHT:
+            return 1280, RENDER_MAX_HEIGHT
+        return width, height
+    if video_path:
+        _, src_h = probe_video_size(video_path)
+        if src_h > RENDER_MAX_HEIGHT:
+            return 1280, RENDER_MAX_HEIGHT
+    return width, height
+
+
+def _cpu_quota() -> float:
+    """CPU cores this process may use, from the container's cgroup quota.
+
+    The free deploy host reports many host cores but allows 0.1 CPU, so
+    os.cpu_count() is useless there — the quota decides whether hardware
+    encoders can exist and how expensive x264 may be."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:  # cgroup v2
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            return float(quota) / float(period)
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as f:
+            quota = int(f.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as f:
+            period = int(f.read().strip())
+        if quota > 0 and period > 0:
+            return quota / period
+    except (OSError, ValueError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
 def detect_encoder() -> str:
     """Pick a working H.264 encoder, preferring hardware (fast)."""
     global _cached_encoder
     with _encoder_lock:
         if _cached_encoder:
+            return _cached_encoder
+
+        # A throttled container has no GPU, and probing encoders that are
+        # compiled in but unusable is not free: on the 0.1-CPU host it sat on
+        # "detecting..." for minutes and starved the health check.
+        if _cpu_quota() < 1.0:
+            _cached_encoder = "libx264"
             return _cached_encoder
 
         candidates = ["h264_qsv", "h264_nvenc", "h264_amf", "libx264"]
@@ -161,15 +235,19 @@ def detect_encoder() -> str:
             if enc == "libx264":
                 _cached_encoder = enc
                 return enc
-            test = subprocess.run(
-                [
-                    FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "lavfi", "-i", "color=size=64x64:rate=1:duration=0.1",
-                    "-c:v", enc, "-f", "null", "-",
-                ],
-                capture_output=True,
-                text=True,
-            )
+            try:
+                test = subprocess.run(
+                    [
+                        FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", "color=size=64x64:rate=1:duration=0.1",
+                        "-c:v", enc, "-f", "null", "-",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                continue
             if test.returncode == 0:
                 _cached_encoder = enc
                 return enc
@@ -185,15 +263,25 @@ def _encoder_args(encoder: str) -> list[str]:
         return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "23"]
     if encoder == "h264_amf":
         return ["-c:v", "h264_amf", "-quality", "quality", "-qp_i", "23", "-qp_p", "23"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    cores = _cpu_quota()
+    # ultrafast is ~2x the speed of veryfast for a slightly larger file — the
+    # right trade on a host that gives the whole app a fraction of a core.
+    preset = "ultrafast" if cores < 1.0 else "veryfast"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", "23",
+            "-threads", str(max(1, min(4, int(cores) or 1)))]
 
 
-def probe_duration(video_path: str) -> float:
+def _ffprobe_path() -> str | None:
     ffprobe = os.path.join(os.path.dirname(FFMPEG_PATH), "ffprobe.exe")
     if not os.path.isfile(ffprobe):
         ffprobe = os.path.join(os.path.dirname(FFMPEG_PATH), "ffprobe")
     if not os.path.isfile(ffprobe):
         ffprobe = shutil.which("ffprobe")
+    return ffprobe
+
+
+def probe_duration(video_path: str) -> float:
+    ffprobe = _ffprobe_path()
     if not ffprobe:
         return 0.0
     r = subprocess.run(
@@ -208,6 +296,40 @@ def probe_duration(video_path: str) -> float:
         return 0.0
 
 
+def probe_video_size(path: str) -> tuple[int, int]:
+    """(width, height) of the first video stream, or (0, 0) when unknown."""
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return 0, 0
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0:s=x", path],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        w, h = r.stdout.strip().splitlines()[0].split("x")[:2]
+        return int(w), int(h)
+    except (ValueError, IndexError):
+        return 0, 0
+
+
+def has_video_stream(path: str) -> bool:
+    """False for an audio-only file — there is no picture to burn into."""
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return True  # cannot check; let FFmpeg report it
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_type",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True,
+        text=True,
+    )
+    return "video" in (r.stdout or "")
+
+
 def render_captions(
     video_path: str,
     srt_content: str,
@@ -219,6 +341,12 @@ def render_captions(
     os.makedirs(TEMP_DIR, exist_ok=True)
     styles = {**DEFAULT_STYLES, **(styles or {})}
 
+    if not has_video_stream(video_path):
+        raise RuntimeError(
+            "This file has no picture (it is the extracted soundtrack). "
+            "Render from the video itself so the captions are burned into the image."
+        )
+
     srt_fd, srt_path = tempfile.mkstemp(suffix=".srt", dir=TEMP_DIR)
     os.close(srt_fd)
     write_srt_file(inject_position(srt_content, styles.get("position", "bottom")), srt_path)
@@ -228,6 +356,7 @@ def render_captions(
 
     total = probe_duration(video_path)
 
+    width, height = _clamp_resolution(width, height, video_path)
     scale_filter = ""
     if width and height:
         scale_filter = _scale_filter(int(width), int(height))
@@ -249,26 +378,35 @@ def render_captions(
     ]
 
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # stderr into stdout: reading only one pipe while FFmpeg fills the
+        # other deadlocks the render once a pipe buffer is full.
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
+        # Keep the web server responsive on a fractional-core host.
+        preexec_fn=(lambda: os.nice(10)) if hasattr(os, "nice") else None,
     )
 
     assert proc.stdout is not None
+    tail: list[str] = []
     for line in proc.stdout:
         line = line.strip()
         if line.startswith("out_time_ms="):
             try:
-                ms = int(line.split("=", 1)[1])
+                # Despite the name, FFmpeg reports microseconds here.
+                us = int(line.split("=", 1)[1])
                 if progress_cb and total > 0:
-                    progress_cb(min(99, ms / (total * 1000) * 100))
+                    progress_cb(min(99, us / (total * 1_000_000) * 100))
             except (ValueError, ZeroDivisionError):
                 pass
+        elif line:
+            tail.append(line)
+            if len(tail) > 200:
+                del tail[:100]
 
-    stderr = proc.stderr.read() if proc.stderr else ""
     proc.wait()
 
     if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg error: {stderr[-3000:]}")
+        raise RuntimeError(f"FFmpeg error: " + "\n".join(tail)[-3000:])
 
     return out_path
 

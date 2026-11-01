@@ -58,6 +58,17 @@ def prune_static(media_ids):
     media_store.prune_static(_STATIC_DIR, media_ids)
 
 
+def publish_render(job_id: str):
+    # The rendered MP4 goes to disk and is streamed by Streamlit's static
+    # server: bytes in the app (r.content + download_button copies) were what
+    # OOM-killed the 512MB host after a render.
+    return media_store.publish_render(API_URL, _STATIC_DIR, job_id)
+
+
+def prune_renders(job_ids):
+    media_store.prune_renders(_STATIC_DIR, job_ids)
+
+
 def source_is_video() -> bool:
     """The picked clip was a video, whose soundtrack is uploaded first."""
     return media_store.is_audio_proxy((ss.get("file_meta") or {}).get("name") or "")
@@ -289,6 +300,23 @@ div[data-testid="stFileUploaderDropzoneInstructions"] span { color: var(--text);
   color: #04160F;
 }
 
+/* Download link for the burned MP4: Streamlit's download_button needs the
+   whole video in RAM, which OOM-kills the 512MB host, so the file is served
+   from the static dir and this is a plain link with a download attribute. */
+a.dl-btn {
+  display: block;
+  margin-top: 0.5rem;
+  text-align: center;
+  text-decoration: none !important;
+  font-weight: 800;
+  padding: 0.62rem 1.2rem;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #34D399, #10B981);
+  color: #04160F !important;
+}
+a.dl-btn:hover { filter: brightness(1.07); }
+a.dl-btn:active { transform: translateY(1px); }
+
 /* ---------- Selectable chips ---------- */
 button[data-testid^="stBaseButton-segmented_control"],
 button[data-testid^="stBaseButton-pills"] {
@@ -407,6 +435,36 @@ RESOLUTIONS = {
     "480p": (854, 480),
 }
 
+
+def _host_cpu_quota() -> float:
+    """CPU quota of this container (>=1.0 on a normal host).
+
+    The free deploy host reports many host cores but allows 0.1 CPU; there a
+    1080p x264 encode peaks at 327MB RSS (measured on the 8-min Hashr clip)
+    before Streamlit and the API are counted — that is what OOM-killed it.
+    The backend clamps to 720p on such hosts too, so the UI must not offer
+    what cannot run."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:  # cgroup v2
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            return float(quota) / float(period)
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as f:
+            quota = float(f.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as f:
+            period = float(f.read().strip())
+        if quota > 0 and period > 0:
+            return quota / period
+    except (OSError, ValueError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
+_LOW_CPU = _host_cpu_quota() < 1.0
+
 LANGS = {
     "ar": "Arabic",
     "en": "English",
@@ -426,8 +484,9 @@ ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
 ss.setdefault("render_started", None)
-ss.setdefault("render_bytes", None)
+ss.setdefault("render_url", None)
 ss.setdefault("render_name", None)
+ss.setdefault("render_file", None)
 # media_id of the video, uploaded separately at the burn-in step when the
 # recitation itself was an audio file (captions still need something to burn
 # into).
@@ -641,6 +700,43 @@ if (!window.__qcap) {{
     return w || null;
   }}
 
+  // The fast upload sends only the soundtrack, so the player would sit on a
+  // black frame until the full video transfer lands. The browser already
+  // holds the picked file (auto_proxy keeps it on window.__qcapSource), so
+  // play THAT copy via a Blob URL: the picture appears with the captions and
+  // the background upload keeps running for the burn-in render.
+  function localBlob() {{
+    var f = window.__qcapSource;
+    if (!f) return null;
+    try {{
+      if (window.__qcapBlobSrc && window.__qcapBlobFor === f) return window.__qcapBlobSrc;
+      if (window.__qcapBlobSrc) {{ try {{ URL.revokeObjectURL(window.__qcapBlobSrc); }} catch (e) {{}} }}
+      window.__qcapBlobSrc = URL.createObjectURL(f);
+      window.__qcapBlobFor = f;
+      return window.__qcapBlobSrc;
+    }} catch (e) {{ return null; }}
+  }}
+
+  function useLocalVideo() {{
+    var w = curWrap();
+    if (!w) return;
+    var v = w.querySelector('video');
+    if (!v) return;
+    var b = localBlob();
+    if (!b || v.getAttribute('src') === b) return;
+    var t = v.currentTime || 0;
+    var playing = !v.paused && t > 0;
+    v.src = b;
+    if (t > 0) {{
+      v.addEventListener('loadedmetadata', function once() {{
+        v.removeEventListener('loadedmetadata', once);
+        try {{ v.currentTime = t; }} catch (e) {{}}
+        if (playing) v.play().catch(function () {{}});
+      }});
+    }}
+  }}
+  window.__qcap.useLocalVideo = useLocalVideo;
+
   function syncPos() {{
     try {{
       var w = curWrap();
@@ -738,6 +834,10 @@ if (!window.__qcap) {{
     if (w) applyStyleTo(w);
   }});
   setInterval(function () {{ var w = curWrap(); if (w) syncPos(); }}, 250);
+  // Streamlit reruns can re-emit the block with the server (audio) source, so
+  // the local picture is re-applied whenever the element shows a different
+  // source; the Blob itself is created once per picked file.
+  setInterval(useLocalVideo, 250);
 
   document.addEventListener('click', function (e) {{
     var b = e.target.closest ? e.target.closest('#fsbtn') : null;
@@ -769,7 +869,7 @@ if (wrap) {{
   applyStyleTo(wrap);
   var v0 = wrap.querySelector('video');
   if (v0) {{
-    if (v0.getAttribute('src') && v0.getAttribute('src').startsWith('data:')) {{
+    if (!window.__qcapSource && v0.getAttribute('src') && v0.getAttribute('src').startsWith('data:')) {{
       (async function() {{
         try {{
           var blob = await (await fetch(v0.getAttribute('src'))).blob();
@@ -777,6 +877,7 @@ if (wrap) {{
         }} catch (e) {{}}
       }})();
     }}
+    if (window.__qcap && window.__qcap.useLocalVideo) window.__qcap.useLocalVideo();
     v0.addEventListener('loadedmetadata', restorePos);
     upd(wrap, v0.currentTime || 0);
   }}
@@ -981,6 +1082,8 @@ if ss["align_result"] is None:
             )
             if is_new:
                 prune_static([ss.get("media_id"), ss.get("video_media_id")])
+                prune_renders([ss.get("render_file")])
+                ss["render_file"] = None
                 ss["file_bytes"] = uploaded.getvalue()
                 ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
                 ss["align_result"] = None
@@ -990,7 +1093,7 @@ if ss["align_result"] is None:
                 ss["sync_sig"] = None
                 ss["lang"] = "ar"
                 ss["render_job_id"] = None
-                ss["render_bytes"] = None
+                ss["render_url"] = None
                 ss["render_name"] = None
                 ss["media_id"] = uuid.uuid4().hex[:10]
                 ss["media_url"] = None
@@ -1003,8 +1106,9 @@ if ss["align_result"] is None:
             if source_is_video():
                 st.caption(
                     f"Video received: **{source_video_name()}** — only its soundtrack "
-                    "was sent ahead so captions can start now. The picture uploads "
-                    "next for the burn-in, and the MP4 keeps your video."
+                    "was sent ahead so captions can start now. The picture plays "
+                    "from your device straight away; the full video uploads in "
+                    "the background for the burn-in, and the MP4 keeps your video."
                 )
 
         has_file = ss["file_bytes"] is not None or ss.get("media_uploaded")
@@ -1147,8 +1251,8 @@ if ss["align_result"] is not None and ss["segments"]:
         )
         if source_is_video() and not ss.get("video_uploaded"):
             st.caption(
-                "Your video is still uploading — the preview plays its soundtrack "
-                "for now and switches to the picture automatically when it lands."
+                "Your video is uploading in the background — the picture already "
+                "plays from your device, and rendering unlocks when the upload lands."
             )
 
         lang = st.segmented_control(
@@ -1261,7 +1365,15 @@ if ss["align_result"] is not None and ss["segments"]:
         st.caption("Files follow the caption language selected above.")
 
         st.markdown('<div class="subhead">Burn into the video</div>', unsafe_allow_html=True)
-        res_label = st.selectbox("Output resolution", list(RESOLUTIONS.keys()), index=0)
+        _choices = list(RESOLUTIONS.keys())
+        if _LOW_CPU:
+            _choices = [k for k in _choices if (RESOLUTIONS[k][1] or 0) <= 720]
+        res_label = st.selectbox(
+            "Output resolution", _choices,
+            index=_choices.index("720p") if _LOW_CPU and "720p" in _choices else 0,
+        )
+        if _LOW_CPU:
+            st.caption("This free host renders up to 720p — 1080p exceeds its memory limit.")
         res_w, res_h = RESOLUTIONS[res_label]
 
         # An audio upload has no picture to burn the captions into, so the
@@ -1286,21 +1398,25 @@ if ss["align_result"] is not None and ss["segments"]:
                     st.caption(f"Video: {source_video_name()}")
             else:
                 st.caption("The video the captions are burned into.")
-            _vfile = st.file_uploader(
-                "Video for the burned-in MP4",
-                type=["mp4", "webm", "mov", "avi", "mkv"],
-                label_visibility="collapsed",
-                # A new clip gets a fresh widget, so the previous clip's video
-                # can never be rendered under the new captions.
-                key=f"video_uploader_{ss['media_id']}",
-            )
-            if _vfile is not None:
-                if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
-                    ss["video_media_id"] = uuid.uuid4().hex[:10]
-                    ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
-                    ss["preview_video_uri"] = None
-                    ss["preview_video_tried"] = False
-                if not ss.get("video_uploaded"):
+            # The uploader is only rendered until the video is on the engine:
+            # Streamlit keeps every uploaded file in memory (BytesIO) for as
+            # long as its widget exists, and a 40MB+ video held for the rest
+            # of the session is part of what OOM-killed the 512MB host.
+            if not ss.get("video_uploaded"):
+                _vfile = st.file_uploader(
+                    "Video for the burned-in MP4",
+                    type=["mp4", "webm", "mov", "avi", "mkv"],
+                    label_visibility="collapsed",
+                    # A new clip gets a fresh widget, so the previous clip's video
+                    # can never be rendered under the new captions.
+                    key=f"video_uploader_{ss['media_id']}",
+                )
+                if _vfile is not None:
+                    if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
+                        ss["video_media_id"] = uuid.uuid4().hex[:10]
+                        ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
+                        ss["preview_video_uri"] = None
+                        ss["preview_video_tried"] = False
                     try:
                         with st.spinner("Uploading the original video…"):
                             up = post_media(
@@ -1310,18 +1426,17 @@ if ss["align_result"] is not None and ss["segments"]:
                             st.error(f"Video upload failed: {api_error(up)}")
                         else:
                             ss["video_uploaded"] = True
-                            # Swap the preview from the audio to the real
-                            # picture and drop the background note.
+                            # Drop the uploader (and with it the in-memory
+                            # file) and swap the preview to the real picture.
                             st.rerun()
                     except requests.RequestException as e:
                         st.error(f"Video upload failed: {e}")
-                else:
-                    st.success("Original video uploaded — ready to render.")
-            if not ss.get("video_uploaded"):
                 if _from_video:
                     st.caption("If the automatic transfer stalled, pick the video file again above.")
                 else:
                     st.caption("Captions are burned into a picture — add the video to use.")
+            else:
+                st.success("Original video uploaded — ready to render.")
 
         # Without the picture there is nothing to burn into, so the render
         # stays locked instead of failing in FFmpeg (it needs a video stream).
@@ -1376,9 +1491,12 @@ if ss["align_result"] is not None and ss["segments"]:
                 elif resp.status_code != 200:
                     st.error(f"Render failed to start: {api_error(resp)}")
                 else:
+                    # A previous render from this session is replaced, not kept.
+                    prune_renders([ss.get("render_file")])
+                    ss["render_file"] = None
                     ss["render_job_id"] = resp.json()["job_id"]
                     ss["render_started"] = time.time()
-                    ss["render_bytes"] = None
+                    ss["render_url"] = None
                     ss["render_name"] = None
 
         if ss["render_job_id"]:
@@ -1402,16 +1520,15 @@ if ss["align_result"] is not None and ss["segments"]:
                     st.error(f"Render failed: {job['error']}")
                     ss["render_job_id"] = None
                 elif job["status"] == "done":
-                    ss["render_name"] = f"quran_captions_{ss['render_job_id']}.mp4"
-                    try:
-                        r = requests.get(f"{API_URL}/render/result/{ss['render_job_id']}", timeout=1200)
-                        if r.status_code == 200:
-                            ss["render_bytes"] = r.content
-                        else:
-                            st.error("Could not download the rendered video.")
-                    except requests.RequestException as e:
-                        st.error(f"Could not download the rendered video: {e}")
+                    _job = ss["render_job_id"]
+                    ss["render_name"] = f"quran_captions_{_job}.mp4"
+                    url = publish_render(_job)
                     ss["render_job_id"] = None
+                    if url:
+                        ss["render_url"] = url
+                        ss["render_file"] = _job
+                    else:
+                        st.error("Could not fetch the rendered video.")
                 else:
                     # Polling re-executes this whole script, and on the free
                     # tier that rerun competes with FFmpeg for the same 0.1
@@ -1422,14 +1539,16 @@ if ss["align_result"] is not None and ss["segments"]:
 
         # The finished render stays available: a download click reruns the
         # script, so the result must outlive the single poll that produced it.
-        if ss.get("render_bytes") and not ss["render_job_id"]:
+        # It lives in the static dir (streamed from disk with range support),
+        # never in this process's memory.
+        if ss.get("render_url") and not ss["render_job_id"]:
             st.success("Video rendered.")
-            st.video(ss["render_bytes"])
-            st.download_button(
-                "Download MP4", data=ss["render_bytes"],
-                file_name=ss.get("render_name") or "quran_captions.mp4",
-                mime="video/mp4", width="stretch",
-                icon=":material/download:",
+            st.video(ss["render_url"])
+            st.markdown(
+                f'<a class="dl-btn" href="{ss["render_url"]}" '
+                f'download="{ss.get("render_name") or "quran_captions.mp4"}">'
+                '<span>Download MP4</span></a>',
+                unsafe_allow_html=True,
             )
 
     # ---------------------------------------------------------------- Sync inspector
@@ -1520,5 +1639,6 @@ if ss["align_result"] is not None and ss["segments"]:
             key="start_over",
         ):
             prune_static([ss.get("media_id"), ss.get("video_media_id")])
+            prune_renders([ss.get("render_file")])
             ss.clear()
             st.rerun()

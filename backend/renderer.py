@@ -156,6 +156,32 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
+RENDER_MAX_HEIGHT = 720
+
+
+def _clamp_resolution(width: int | None, height: int | None,
+                      video_path: str | None = None
+                      ) -> tuple[int | None, int | None]:
+    """Keep x264 inside the free host's 512MB.
+
+    Measured on the real 8-min Al-Hashr clip: 1080p veryfast peaks at 327MB
+    RSS, 720p ultrafast at 88MB. On a fractional-core container the extra
+    frame memory plus the base processes is what trips the OOM killer, and a
+    720p source could only be upscaled anyway. "Original" (no explicit size)
+    is clamped too, after probing the source — most phone videos are 1080p."""
+    if _cpu_quota() >= 1.0:
+        return width, height
+    if width and height:
+        if int(height) > RENDER_MAX_HEIGHT:
+            return 1280, RENDER_MAX_HEIGHT
+        return width, height
+    if video_path:
+        _, src_h = probe_video_size(video_path)
+        if src_h > RENDER_MAX_HEIGHT:
+            return 1280, RENDER_MAX_HEIGHT
+    return width, height
+
+
 def _cpu_quota() -> float:
     """CPU cores this process may use, from the container's cgroup quota.
 
@@ -270,6 +296,25 @@ def probe_duration(video_path: str) -> float:
         return 0.0
 
 
+def probe_video_size(path: str) -> tuple[int, int]:
+    """(width, height) of the first video stream, or (0, 0) when unknown."""
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return 0, 0
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0:s=x", path],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        w, h = r.stdout.strip().splitlines()[0].split("x")[:2]
+        return int(w), int(h)
+    except (ValueError, IndexError):
+        return 0, 0
+
+
 def has_video_stream(path: str) -> bool:
     """False for an audio-only file — there is no picture to burn into."""
     ffprobe = _ffprobe_path()
@@ -311,6 +356,7 @@ def render_captions(
 
     total = probe_duration(video_path)
 
+    width, height = _clamp_resolution(width, height, video_path)
     scale_filter = ""
     if width and height:
         scale_filter = _scale_filter(int(width), int(height))

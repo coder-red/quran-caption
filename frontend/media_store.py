@@ -127,3 +127,44 @@ def prune_static(static_dir: str, media_ids):
                 os.remove(os.path.join(static_dir, name))
             except OSError:
                 pass
+
+
+def publish_render(api_url: str, static_dir: str, job_id: str):
+    """Stream a finished render into the static dir; return its URL.
+
+    The burned MP4 can be 100MB+. Reading it into the Streamlit process
+    (`requests.get(...).content`) and handing those bytes to st.video /
+    st.download_button kept several copies alive and OOM-killed the 512MB
+    host right after a render. The file goes straight to disk here; the
+    browser streams it with range requests."""
+    dst = os.path.join(static_dir, f"render_{job_id}.mp4")
+    try:
+        os.makedirs(static_dir, exist_ok=True)
+        with requests.get(f"{api_url}/render/result/{job_id}",
+                          stream=True, timeout=(30, 3600)) as r:
+            if r.status_code != 200:
+                return None
+            with open(dst, "wb") as fh:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+        return f"/app/static/render_{job_id}.mp4?v={int(os.path.getmtime(dst))}"
+    except (requests.RequestException, OSError):
+        return None
+
+
+def prune_renders(static_dir: str, job_ids):
+    """Remove this session's rendered files (never another session's)."""
+    ids = [i for i in job_ids if i]
+    if not ids:
+        return
+    try:
+        names = os.listdir(static_dir)
+    except OSError:
+        return
+    for name in names:
+        if any(name.startswith(f"render_{i}.") for i in ids):
+            try:
+                os.remove(os.path.join(static_dir, name))
+            except OSError:
+                pass

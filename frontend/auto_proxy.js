@@ -31,6 +31,13 @@
       document.querySelectorAll('[data-testid="stFileUploaderDropzoneInput"]'));
   }
 
+  // The burn-in uploader lives in a keyed Streamlit container named
+  // st-key-video_uploader_..., so its input can be told apart from the
+  // step-1 uploader even when it is the only one on the page.
+  function burnInBox() {
+    return document.querySelector('[class*="st-key-video_uploader"]');
+  }
+
   function note(msg, bad) {
     var el = document.getElementById('qcap-proxy-note');
     if (!el) {
@@ -105,6 +112,10 @@
     var input = ev.target;
     if (!input || input.type !== 'file' || injecting) { return; }
     if (input.getAttribute('data-qcap-burnin')) { return; }
+    // A manual pick in the burn-in uploader IS the picture the user chose:
+    // proxying it would hand that uploader an .ogg it cannot accept.
+    var vbox = burnInBox();
+    if (vbox && vbox.contains && vbox.contains(input)) { return; }
     var inputs = uploaderInputs();
     if (inputs.length === 0 || input !== inputs[0]) { return; }
     var f = input.files && input.files[0];
@@ -143,11 +154,16 @@
   // the full-size upload run while the user edits styles.
   function fillBurnIn() {
     if (!window.__qcapSource || window.__qcapSourceUsed) { return; }
-    var inputs = uploaderInputs();
-    if (inputs.length < 2) { return; }
-    var box = document.querySelector('[class*="st-key-video_uploader"]');
-    var target = box ? box.querySelector('input[type=file]') : inputs[inputs.length - 1];
-    if (!target || (target.files && target.files.length)) { return; }
+    var box = burnInBox();
+    var target = box ? box.querySelector('input[type=file]') : null;
+    if (!target) {
+      // Before the burn-in step mounts, the only uploader is step 1 — never
+      // refill that one with the video.
+      var inputs = uploaderInputs();
+      if (inputs.length < 2) { return; }
+      target = inputs[inputs.length - 1];
+    }
+    if (target.files && target.files.length) { return; }
     window.__qcapSourceUsed = true;
     target.setAttribute('data-qcap-burnin', '1');
     note('Video ' + fmtSize(window.__qcapSource.size) + ' uploading in the background');

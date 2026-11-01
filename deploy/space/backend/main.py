@@ -222,8 +222,16 @@ def _align_impl(
         try:
             import numpy as np
 
-            loud_idx = np.nonzero(np.abs(audio_full) > 0.004)[0]
-            audible_end = (float(loud_idx[-1]) + 1.0) / sr_full if len(loud_idx) else dur
+            # argmax over the reversed boolean: the old nonzero() built an
+            # int64 index for every loud sample (30 min = 7.6M -> 61MB; a
+            # full-length clip twice that), which the 512MB host cannot spare.
+            loud = np.abs(audio_full) > 0.004
+            if loud.any():
+                last = int(len(loud) - 1 - np.argmax(loud[::-1]))
+                audible_end = min(dur, (last + 1.0) / sr_full)
+            else:
+                audible_end = dur
+            del loud
         except Exception:
             audible_end = dur
         setp("analyzing speech…", 8)

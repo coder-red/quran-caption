@@ -35,6 +35,7 @@ STUB = textwrap.dedent("""
         getAttribute: function (k) { return this.attrs[k] || null; },
         dispatchEvent: function (ev) { this.lastEvent = ev; },
         querySelector: function () { return null; },
+        contains: function () { return false; },
         closest: function () { return null; }
       };
     }
@@ -184,6 +185,70 @@ FALLBACK_DRIVE = textwrap.dedent("""
     }, 50);
 """)
 
+# In the result view the step-1 uploader is gone, so the burn-in uploader is
+# the only file input on the page — the background fill must still find it.
+ONLY_BURNIN_FILL_DRIVE = textwrap.dedent("""
+    function assert(c, msg) {
+      if (!c) { console.error('FAIL: ' + msg); process.exit(1); }
+    }
+
+    var MAIN = __input();
+    var FAKE = { name: 'recitation.mp4', type: 'video/mp4', size: 40000000 };
+    MAIN.files = [FAKE];
+    window.QcapProxy = {
+      buildAudioProxy: function () {
+        return Promise.resolve({
+          file: new File([], 'x.ogg', { type: 'audio/ogg' }), bytes: 2000000
+        });
+      }
+    };
+    __changeHandler({ target: MAIN, stopPropagation: function () {},
+                      stopImmediatePropagation: function () {} });
+    setTimeout(function () {
+      // The result view mounted: only the burn-in uploader exists now.
+      __inputs.length = 0;
+      var BURN = __input();
+      __videoBox = __el('div');
+      __videoBox.querySelector = function () { return BURN; };
+      __intervals.forEach(function (f) { f(); });
+      assert(window.__qcapSourceUsed, 'auto-fill must run once');
+      assert(BURN.files && BURN.files[0] === FAKE,
+             'the burn-in uploader must get the video');
+      assert(BURN.getAttribute('data-qcap-burnin'), 'burn-in input is marked');
+      console.log(JSON.stringify({ ok: true, burn: BURN.files[0].name }));
+    }, 50);
+""")
+
+# A manual pick in the burn-in uploader is already the picture: proxying it
+# would replace the video with an .ogg that uploader rejects.
+MANUAL_BURNIN_DRIVE = textwrap.dedent("""
+    function assert(c, msg) {
+      if (!c) { console.error('FAIL: ' + msg); process.exit(1); }
+    }
+
+    var BURN = __input();
+    var FAKE = { name: 'recitation.mp4', type: 'video/mp4', size: 40000000 };
+    BURN.files = [FAKE];
+    __videoBox = __el('div');
+    __videoBox.contains = function (el) { return el === BURN; };
+    var proxied = false, stopped = false;
+    window.QcapProxy = {
+      buildAudioProxy: function () {
+        proxied = true;
+        return Promise.resolve({ file: BURN.files[0] });
+      }
+    };
+    __changeHandler({ target: BURN,
+                      stopPropagation: function () { stopped = true; },
+                      stopImmediatePropagation: function () { stopped = true; } });
+    setTimeout(function () {
+      assert(!proxied, 'a manual burn-in pick must not be re-encoded');
+      assert(!stopped, 'the event must reach Streamlit untouched');
+      assert(!BURN.lastEvent, 'nothing may be re-injected into the burn-in');
+      console.log(JSON.stringify({ ok: true }));
+    }, 50);
+""")
+
 PASSTHROUGH_DRIVE = textwrap.dedent("""
     var MAIN = __input();
     var AUDIO = { name: 'clip.mp3', type: 'audio/mpeg', size: 3000000 };
@@ -257,3 +322,16 @@ def test_extraction_failure_falls_back_to_the_original(tmp_path):
 @node_only
 def test_audio_files_are_never_touched(tmp_path):
     assert _run(tmp_path, "auto_proxy_audio.js", PASSTHROUGH_DRIVE)["ok"]
+
+
+@node_only
+def test_burnin_is_filled_when_it_is_the_only_uploader(tmp_path):
+    """After aligning, step 1 is gone — the background upload must still run."""
+    r = _run(tmp_path, "auto_proxy_only_burnin.js", ONLY_BURNIN_FILL_DRIVE)
+    assert r == {"ok": True, "burn": "recitation.mp4"}
+
+
+@node_only
+def test_manual_burnin_pick_reaches_streamlit_untouched(tmp_path):
+    assert _run(tmp_path, "auto_proxy_manual_burnin.js",
+                MANUAL_BURNIN_DRIVE)["ok"]
