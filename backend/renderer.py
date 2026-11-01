@@ -316,28 +316,35 @@ def render_captions(
     ]
 
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # stderr into stdout: reading only one pipe while FFmpeg fills the
+        # other deadlocks the render once a pipe buffer is full.
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
         # Keep the web server responsive on a fractional-core host.
         preexec_fn=(lambda: os.nice(10)) if hasattr(os, "nice") else None,
     )
 
     assert proc.stdout is not None
+    tail: list[str] = []
     for line in proc.stdout:
         line = line.strip()
         if line.startswith("out_time_ms="):
             try:
-                ms = int(line.split("=", 1)[1])
+                # Despite the name, FFmpeg reports microseconds here.
+                us = int(line.split("=", 1)[1])
                 if progress_cb and total > 0:
-                    progress_cb(min(99, ms / (total * 1000) * 100))
+                    progress_cb(min(99, us / (total * 1_000_000) * 100))
             except (ValueError, ZeroDivisionError):
                 pass
+        elif line:
+            tail.append(line)
+            if len(tail) > 200:
+                del tail[:100]
 
-    stderr = proc.stderr.read() if proc.stderr else ""
     proc.wait()
 
     if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg error: {stderr[-3000:]}")
+        raise RuntimeError(f"FFmpeg error: " + "\n".join(tail)[-3000:])
 
     return out_path
 

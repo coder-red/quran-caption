@@ -319,6 +319,7 @@ ss.setdefault("media_id", None)
 ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
+ss.setdefault("render_started", None)
 # media_id of the video, uploaded separately at the burn-in step when the
 # recitation itself was an audio file (captions still need something to burn
 # into).
@@ -1190,6 +1191,7 @@ if ss["align_result"] is not None and ss["segments"]:
                 st.error(f"Render failed to start: {api_error(resp)}")
             else:
                 ss["render_job_id"] = resp.json()["job_id"]
+                ss["render_started"] = time.time()
 
     if ss["render_job_id"]:
         try:
@@ -1200,10 +1202,13 @@ if ss["align_result"] is not None and ss["segments"]:
         if status_resp is not None and status_resp.status_code == 200:
             job = status_resp.json()
             prog = st.progress(0, text="Starting…")
+            _elapsed = int(time.time() - ss.get("render_started", time.time()))
             prog.progress(min(100, int(job["progress"])),
                           text=f"{job['status'].title()} · {job['progress']:.0f}%"
-                               + (f" · {job['encoder']}" if job.get("encoder") else ""))
-            st.caption("Rendering in the background — you can close this tab.")
+                               + (f" · {job['encoder']}" if job.get("encoder") else "")
+                               + (f" · {_elapsed // 60} min {_elapsed % 60:02d}s" if _elapsed >= 60 else ""))
+            st.caption("Rendering on a shared CPU — a long clip takes several minutes. "
+                       "Keep this tab open to download the result.")
 
             if job["status"] == "error":
                 st.error(f"Render failed: {job['error']}")
@@ -1225,7 +1230,10 @@ if ss["align_result"] is not None and ss["segments"]:
                     st.error(f"Could not download the rendered video: {e}")
                 ss["render_job_id"] = None
             else:
-                time.sleep(1.5)
+                # Polling re-executes this whole script, and on the free tier
+                # that rerun competes with FFmpeg for the same 0.1 CPU — a
+                # 1.5s poll starved the encoder and a 70s clip took >12 min.
+                time.sleep(6)
                 st.rerun()
 
     def on_segment_edit():
