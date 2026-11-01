@@ -58,6 +58,10 @@ class AlignResponse(BaseModel):
     # on: 'torch' | 'onnx' | 'energy'. The energy fallback finds different
     # pauses than Silero, so this is reported rather than hidden.
     vad_backend: str = "unknown"
+    # Which alignment engine produced these captions ('qud' | 'groq' | ...).
+    # QUD can silently fall back to Groq on quota/outage, so the client must
+    # be able to tell which one actually ran.
+    engine: str = ""
 
 
 class RenderRequest(BaseModel):

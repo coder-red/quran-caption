@@ -6,6 +6,9 @@ from backend.config import ASR_BACKEND
 
 def get_asr_provider(name: Optional[str] = None):
     name = (name or ASR_BACKEND).strip().lower()
+    if name == "qud":
+        from backend.providers.qud import QudProvider
+        return QudProvider()
     if name == "groq":
         from backend.providers.groq import GroqProvider
         return GroqProvider()

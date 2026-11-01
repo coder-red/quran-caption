@@ -22,7 +22,7 @@ from backend.models import (
 from backend.aligner import ASREngine
 from backend.detector import SurahDetector
 from backend.renderer import render_captions, render_preview, DEFAULT_STYLES
-from backend.config import TEMP_DIR, CONFIDENCE_THRESHOLD, FFMPEG_PATH
+from backend.config import TEMP_DIR, CONFIDENCE_THRESHOLD, FFMPEG_PATH, QUD_FALLBACK
 from backend.audio_util import ensure_16k_mono
 
 # Caption-level match gate (lower than CONFIDENCE_THRESHOLD): disjoint rough
@@ -30,9 +30,16 @@ from backend.audio_util import ensure_16k_mono
 # must caption; overlapping spurious lanes are already resolved by coverage
 # vote in the detector. Minutes-long wrong captions scored ~0.57.
 MATCH_GATE = 0.80
-from backend.segmenter import build_srt, segments_from_word_times, segments_from_provider_times, snap_words_to_silence
+from backend.segmenter import (
+    build_srt,
+    segments_from_word_times,
+    segments_from_provider_times,
+    segments_from_qud_alignment,
+    snap_words_to_silence,
+)
 from backend.forced_aligner import ForcedAligner
 from backend.providers import get_asr_provider
+from backend.providers.qud import QudUnavailable
 from backend.audio_util import extract_audio, is_16k_mono_wav
 
 
@@ -140,6 +147,7 @@ def _align_impl(
     callable(stage: str, percent: float) for UI progress reporting.
     media_path: reuse a stored /media copy (owned=False — never deleted)."""
     audio_path = None
+    source_path = None
     sliced_path = None
     temp_slices = []
     owned = media_path is None
@@ -169,15 +177,16 @@ def _align_impl(
         # Extract the audio track once. The result is already 16 kHz mono
         # WAV, so the ASR provider reuses it as-is instead of running a
         # second full-file ffmpeg transcode (see backend/audio_util.py).
+        source_path = audio_path
         if not is_16k_mono_wav(audio_path):
             old_path = audio_path
             audio_path, _ = extract_audio(old_path)
             audio_owned = True
-            if owned:
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
+            # QUD aligns the ORIGINAL compressed file: its extracted 16 kHz
+            # WAV is ~6x larger and the upload timed out on a slow uplink
+            # (QUD accepts mp3/mp4/ogg — verified). The upload is deleted
+            # with the other temp files at the end of the run.
+            source_path = old_path
 
         import soundfile as sf
         from backend.vad import get_speech_segments, merge_segments, chunk_for_whisper, speech_span, silence_runs_from_segments
@@ -248,6 +257,18 @@ def _align_impl(
         _hold_end = min(dur, max(last_speech_end, float(audible_end)))
 
         provider = get_asr_provider(asr_backend)
+        if provider is not None and getattr(provider, "name", "") == "qud":
+            try:
+                return _align_with_qud(provider, source_path or audio_path,
+                                       raw_segs, sil_runs, _hold_end, setp)
+            except QudUnavailable as exc:
+                fallback = get_asr_provider(QUD_FALLBACK)
+                if fallback is None or getattr(fallback, "name", "") == "qud":
+                    return ErrorResponse(error=f"QUD aligner failed: {exc}")
+                setp(f"QUD unavailable ({exc}) — falling back to "
+                     f"{QUD_FALLBACK}…", 20)
+                return _align_with_provider(fallback, audio_path, segs, setp,
+                                            sil_runs, raw_segs, _hold_end)
         if provider is not None:
             return _align_with_provider(provider, audio_path, segs, setp,
                                         sil_runs, raw_segs, _hold_end)
@@ -395,6 +416,7 @@ def _align_impl(
             vtt=vtt_content,
             matches=match_infos,
             vad_backend=_vad_backend_name(),
+            engine="local",
         )
         # Persist a copy so a client timeout / disconnect doesn't lose the
         # (expensive) result — temp/align_result.json survives the cleanup.
@@ -415,6 +437,11 @@ def _align_impl(
                     os.remove(p)
                 except OSError:
                     pass
+        if owned and source_path and source_path != audio_path and os.path.exists(source_path):
+            try:
+                os.remove(source_path)
+            except OSError:
+                pass
         if owned and audio_path and os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
@@ -574,7 +601,8 @@ def _vad_backend_name() -> str:
         return "unknown"
 
 
-def _build_align_response(match_infos, words, segments, end_time: float | None = None) -> AlignResponse | None:
+def _build_align_response(match_infos, words, segments, end_time: float | None = None,
+                          engine: str = "") -> AlignResponse | None:
     if not segments:
         return None
     segments.sort(key=lambda s: s["start"])
@@ -607,6 +635,7 @@ def _build_align_response(match_infos, words, segments, end_time: float | None =
         vtt=vtt_content,
         matches=match_infos,
         vad_backend=_vad_backend_name(),
+        engine=engine,
     )
     try:
         import json
@@ -706,9 +735,164 @@ def _align_with_provider(provider, audio_path: str, segs, p=None, sil_runs=None,
             end_time = min(end_time, float(audible_end))
     except Exception:
         end_time = None
-    response = _build_align_response(match_infos, words, segments, end_time=end_time)
+    response = _build_align_response(match_infos, words, segments, end_time=end_time,
+                                     engine=provider.name)
     if response is None:
         return ErrorResponse(error="Could not map recitation to specific ayahs")
+    return response
+
+
+def _spans_union_len(spans) -> float:
+    """Total length covered by a set of possibly overlapping (start, end) spans."""
+    clean = []
+    for span in spans or ():
+        try:
+            a, b = float(span[0]), float(span[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if b > a:
+            clean.append((a, b))
+    if not clean:
+        return 0.0
+    clean.sort()
+    total = 0.0
+    cur_a, cur_b = clean[0]
+    for a, b in clean[1:]:
+        if a <= cur_b:
+            cur_b = max(cur_b, b)
+        else:
+            total += cur_b - cur_a
+            cur_a, cur_b = a, b
+    return total + (cur_b - cur_a)
+
+
+def _qud_seg_span(qs: dict) -> tuple[float, float] | None:
+    """Absolute (start, end) of one QUD segment, from its reported span or,
+    failing that, from the union of its word times."""
+    try:
+        a = float(qs.get("time_from"))
+        b = float(qs.get("time_to"))
+        if b > a:
+            return a, b
+    except (TypeError, ValueError):
+        pass
+    starts, ends = [], []
+    for w in qs.get("words") or []:
+        try:
+            starts.append(float(qs.get("time_from") or 0.0) + float(w.get("start")))
+            ends.append(float(qs.get("time_from") or 0.0) + float(w.get("end")))
+        except (TypeError, ValueError):
+            continue
+    if starts and ends:
+        return min(starts), max(ends)
+    return None
+
+
+def _qud_surah_ayah(location) -> tuple[int, int] | None:
+    parts = str(location or "").split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _qud_match_infos(quran_segments: list[dict]) -> list[MatchInfo]:
+    """One MatchInfo per contiguous surah run. A repeat inside a surah widens
+    that run's ayah span instead of creating a duplicate match lane."""
+    runs: list[dict] = []
+    for qs in sorted(quran_segments, key=lambda s: float(s.get("time_from") or 0.0)):
+        ref_from = _qud_surah_ayah(qs.get("ref_from"))
+        ref_to = _qud_surah_ayah(qs.get("ref_to")) or ref_from
+        if not ref_from or ref_from[0] < 1:
+            continue
+        surah = ref_from[0]
+        lo, hi = ref_from[1], ref_from[1]
+        if ref_to and ref_to[0] == surah:
+            hi = ref_to[1]
+        lo, hi = min(lo, hi), max(lo, hi)
+        conf = qs.get("confidence")
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = None
+        if runs and runs[-1]["surah"] == surah:
+            run = runs[-1]
+            run["lo"] = min(run["lo"], lo, hi)
+            run["hi"] = max(run["hi"], lo, hi)
+            if conf is not None:
+                run["confs"].append(conf)
+        else:
+            runs.append({
+                "surah": surah, "lo": min(lo, hi), "hi": max(lo, hi),
+                "confs": [conf] if conf is not None else [],
+            })
+    infos = []
+    for run in runs:
+        confs = run["confs"]
+        infos.append(MatchInfo(
+            surah=_surah_info(run["surah"]),
+            start_ayah=run["lo"],
+            end_ayah=run["hi"],
+            confidence=round(sum(confs) / len(confs), 4) if confs else 0.0,
+        ))
+    return infos
+
+
+def _align_with_qud(provider, audio_path: str, raw_segs, sil_runs,
+                    audible_end: float | None = None,
+                    p=None) -> AlignResponse | ErrorResponse:
+    """QUD aligner path: QUD returns ayah-referenced words with phoneme-level
+    times, so no ASR transcript, detector or forced alignment is involved.
+    The captions are the canon text of exactly the words it heard."""
+    from backend.providers.qud import validate_response
+
+    def setp(stage: str, pct: float):
+        if p:
+            p(stage, pct)
+
+    try:
+        result = validate_response(provider.align(
+            audio_path,
+            progress_cb=lambda pct, label: setp(label, pct),
+        ))
+    except QudUnavailable:
+        raise
+    except Exception as exc:
+        raise QudUnavailable(f"QUD aligner failed: {exc}") from exc
+
+    segments_q = result.get("segments") or []
+    quran = [s for s in segments_q if isinstance(s, dict)
+             and str(s.get("kind") or "quran").lower() == "quran"]
+    quran_words = sum(len(s.get("words") or []) for s in quran)
+    if quran_words < 10:
+        raise QudUnavailable(
+            f"QUD aligned only {quran_words} Quran word(s) — not enough to caption")
+
+    voiced = _spans_union_len(raw_segs)
+    aligned = _spans_union_len([_qud_seg_span(s) for s in segments_q])
+    if voiced > 0 and aligned / voiced < 0.35:
+        raise QudUnavailable(
+            f"QUD aligned only {100.0 * aligned / voiced:.0f}% of the voiced audio")
+
+    setp("building captions…", 88)
+    segments, words = segments_from_qud_alignment(segments_q, sil_runs, raw_segs)
+    match_infos = _qud_match_infos(quran)
+    if not match_infos:
+        raise QudUnavailable("QUD returned no Quran ayah references")
+
+    try:
+        import json
+        with open(os.path.join(TEMP_DIR, "align_qud.json"), "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+
+    response = _build_align_response(
+        match_infos, words, segments, end_time=audible_end, engine="qud")
+    if response is None:
+        raise QudUnavailable("QUD alignment produced no captions")
     return response
 
 
@@ -1169,9 +1353,11 @@ async def health():
         backend = vad_backend()
     except Exception:
         backend = "unknown"
+    from backend.config import ASR_BACKEND
+
     return {
         "status": "ok",
-        "asr_backend": os.getenv("ASR_BACKEND", "groq"),
+        "asr_backend": ASR_BACKEND,
         "vad_backend": backend,
         "vad_ok": backend != "energy",
     }

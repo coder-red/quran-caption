@@ -31,8 +31,12 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.3"
-      # Hosted ASR only — no torch on this host.
+      # Hosted alignment only — no torch on this host. QUD³ is keyless; on
+      # quota/outage the API falls back to Groq (QUD_FALLBACK) using the
+      # GROQ_API_KEY below, and the response says which engine ran.
       - key: ASR_BACKEND
+        value: qud
+      - key: QUD_FALLBACK
         value: groq
       # Marks deployed mode so the app spawns + talks to the local FastAPI
       # child instead of assuming an externally-reachable API.

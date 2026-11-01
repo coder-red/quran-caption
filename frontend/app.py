@@ -812,7 +812,7 @@ def show_detection(result: dict):
           <div class="metric-row">
             <div class="metric"><div class="v">{result['start_ayah']}–{result['end_ayah']}</div><div class="l">Ayahs · {n_ayahs} total</div></div>
             <div class="metric"><div class="v">{len(result['segments'])}</div><div class="l">Synced segments</div></div>
-            <div class="metric"><div class="v">{conf:.0%}</div><div class="l">Confidence</div></div>
+            <div class="metric"><div class="v">{conf:.0%}</div><div class="l">Confidence{(' · ' + result['engine'].upper()) if result.get('engine') else ''}</div></div>
           </div>
           <div class="conf-bar"><div class="conf-fill" style="width:{min(100, conf*100):.0f}%"></div></div>
         </div>

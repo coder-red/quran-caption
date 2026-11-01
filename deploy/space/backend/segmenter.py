@@ -381,7 +381,8 @@ def _map_words_to_canon(ws: list[dict], text_ar: str) -> list[int | None] | None
 
 def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None,
                   raw_segs: list[tuple[float, float]] | None = None,
-                  canon_pos: list[int | None] | None = None) -> list[dict]:
+                  canon_pos: list[int | None] | None = None,
+                  trust_times: bool = False) -> list[dict]:
     """Split one ayah segment into breath-phrase segments at REAL pauses
     (inter-word silences >= SILENCE_SPLIT measured from the audio), so the
     caption vanishes while the reciter breathes and resumes where they resume.
@@ -408,6 +409,9 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
     shatter captions). With raw_segs, a phrase ending in a madd word is HELD
     past an early provider cut into continuing voicing (_madd_extend) so the
     caption survives long mujawwad elongations instead of vanishing mid-vowel.
+    trust_times: the word stamps are already phoneme-accurate (QUD aligner) and
+    include the madd — skip the VAD clamp and the madd hold, which could
+    otherwise pull a cue back onto a previous held elongation.
 
     Returns [seg] unchanged when there is no pause to split on."""
     if len(words) < 2:
@@ -430,14 +434,16 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
     cuts = [i + 1 for i, g in enumerate(gaps) if g >= thr - 1e-9]
     if not cuts:
         if raw_segs:
-            s, e = _vad_clamp_bounds(
-                seg["start"], seg["end"], ws[0], ws[-1], raw_segs)
-            # Single-phrase ayah (the common verse-final madd case): hold a
-            # madd tail the provider cut early. verse_final: one region covers
-            # the whole segment, whose text is the full canon ayah here.
-            raw_tail = (seg.get("text_ar") or "").split()
-            e = _madd_extend(e, raw_tail[-1] if raw_tail else "",
-                             True, silence_runs, raw_segs, float("inf"))
+            s, e = float(seg["start"]), float(seg["end"])
+            if not trust_times:
+                s, e = _vad_clamp_bounds(
+                    seg["start"], seg["end"], ws[0], ws[-1], raw_segs)
+                # Single-phrase ayah (the common verse-final madd case): hold a
+                # madd tail the provider cut early. verse_final: one region covers
+                # the whole segment, whose text is the full canon ayah here.
+                raw_tail = (seg.get("text_ar") or "").split()
+                e = _madd_extend(e, raw_tail[-1] if raw_tail else "",
+                                 True, silence_runs, raw_segs, float("inf"))
             # _ws keeps this phrase's OWN words for the word-cue pass: a madd
             # hold can push the phrase end past the next ayah's first word, and
             # time-window membership would then pull that foreign word in.
@@ -563,7 +569,7 @@ def _phrase_split(seg: dict, words: list[dict], silence_runs: list | None = None
         phrase = dict(seg)
         pstart = round(float(ws[lo]["start"]), 3)
         pend = round(float(ws[hi]["end"]), 3)
-        if raw_segs:
+        if raw_segs and not trust_times:
             pstart, pend = _vad_clamp_bounds(
                 pstart, pend, ws[lo], ws[hi], raw_segs)
             # Hold a madd tail the provider cut early (mid-verse cap, bigger
@@ -1003,7 +1009,8 @@ def _cue_groups(ws: list[dict], cpos: list[int | None]) -> list[list[int]]:
 
 
 def _word_cues(seg: dict, ws: list[dict], silence_runs: list | None = None,
-               raw_segs: list | None = None) -> list[dict]:
+               raw_segs: list | None = None,
+               trust_times: bool = False) -> list[dict]:
     """Cut one phrase caption into word-tracked cues (see WORD_CUE_*).
 
     Text stays canon and complete: each cue takes the span of canon words its
@@ -1066,7 +1073,7 @@ def _word_cues(seg: dict, ws: list[dict], silence_runs: list | None = None,
         end = float(ws[g[-1]]["end"])
         if gi == last_gi:
             end = float(seg["end"])
-        elif raw_segs:
+        elif raw_segs and not trust_times:
             cap_next = float(ws[groups[gi + 1][0]]["start"]) - MIN_GAP
             end = _madd_extend(end, ar_words[b_ar - 1], False,
                                silence_runs, raw_segs, cap_next)
@@ -1083,7 +1090,8 @@ def _word_cues(seg: dict, ws: list[dict], silence_runs: list | None = None,
 
 def subdivide_word_cues(segments: list[dict], words: list[dict],
                         silence_runs: list | None = None,
-                        raw_segs: list | None = None) -> list[dict]:
+                        raw_segs: list | None = None,
+                        trust_times: bool = False) -> list[dict]:
     """Re-cut every phrase caption into word-tracked cues. Segments without
     word stamps (openers, wordless bridges) are kept as they are.
 
@@ -1103,7 +1111,7 @@ def subdivide_word_cues(segments: list[dict], words: list[dict],
             lo = bisect_left(mids, float(seg["start"]) - 0.02)
             hi = bisect_right(mids, float(seg["end"]) + 0.02)
             own = ws_all[lo:hi]
-        out.extend(_word_cues(seg, own, silence_runs, raw_segs))
+        out.extend(_word_cues(seg, own, silence_runs, raw_segs, trust_times))
     return out
 
 
@@ -1357,3 +1365,257 @@ def _fmt_ts(seconds: float) -> str:
     m, ms = divmod(ms, 60000)
     s, ms = divmod(ms, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+# ----------------------------------------------------------------- QUD aligner
+
+def _qud_location(location: str) -> tuple[int, int, int]:
+    parts = (location or "").split(":")
+    if len(parts) != 3:
+        raise ValueError(f"bad word location: {location!r}")
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def _qud_word(location: str, rel_start, rel_end, t0: float,
+              text: str = "", cpos: int | None = None) -> dict:
+    try:
+        start = t0 + float(rel_start)
+        end = t0 + float(rel_end)
+    except (TypeError, ValueError):
+        raise ValueError(f"bad word timing at {location!r}")
+    if end < start:
+        end = start
+    word = {"text": text, "start": round(start, 3), "end": round(end, 3)}
+    if cpos is not None:
+        word["_cpos"] = cpos
+    return word
+
+
+def _qud_ayah_pieces(words: list[dict], t0: float, texts_ar: dict):
+    """Split one QUD quran segment into consecutive ayah pieces.
+
+    A new piece starts whenever the ayah changes, so a repeat inside a single
+    segment keeps recitation order instead of being merged into the earlier
+    piece. Word text is OUR canon token at the QUD location (verified to have
+    the same numbering); a location past the ayah's word count means the two
+    tokenizations disagree and the result cannot be trusted."""
+    pieces: list[tuple[int, int, list[dict]]] = []
+    for raw in sorted(words, key=lambda w: float(w.get("start") or 0.0)):
+        surah, ayah, wpos = _qud_location(raw.get("location"))
+        if surah < 1:
+            raise ValueError(f"unexpected non-Quran location {raw.get('location')!r}")
+        canon = (texts_ar.get(f"{surah}:{ayah}") or "").split()
+        if wpos < 1 or wpos > len(canon):
+            raise ValueError(
+                f"QUD word numbering does not match the Quran text at "
+                f"{raw.get('location')} ({len(canon)} words)")
+        if not pieces or (pieces[-1][0], pieces[-1][1]) != (surah, ayah):
+            pieces.append((surah, ayah, []))
+        pieces[-1][2].append(_qud_word(
+            raw.get("location"), raw.get("start"), raw.get("end"),
+            t0, canon[wpos - 1], wpos - 1))
+    return pieces
+
+
+def _qud_special_pieces(qs: dict, words: list[dict], t0: float,
+                        texts_ar: dict, texts_en: dict):
+    """Turn a `kind=special` segment (Basmala / Isti'adha) into display
+    segments. QUD returns openers as specials instead of mushaf refs, so this
+    replaces the old ASR-spelling opener scanner for the QUD path."""
+    stype = (qs.get("special_type") or "").strip().lower()
+    has_isti = "isti" in stype
+    has_basmala = "basmala" in stype
+    by_prefix: dict[str, list[dict]] = {}
+    for raw in words:
+        prefix = ":".join(str(raw.get("location") or "").split(":")[:2])
+        by_prefix.setdefault(prefix, []).append(raw)
+    if not has_isti and "0:1" in by_prefix:
+        has_isti = True
+    if not has_basmala and ("0:0" in by_prefix or "0:2" in by_prefix):
+        has_basmala = True
+    if not has_isti and not has_basmala:
+        raise ValueError(f"unsupported QUD special {qs.get('special_type')!r}")
+
+    groups: list[tuple[str, list[dict]]] = []
+    if has_isti and has_basmala:
+        isti, rest = [], []
+        for w in words:
+            prefix = ":".join(str(w.get("location") or "").split(":")[:2])
+            (isti if prefix == "0:1" else rest).append(w)
+        if isti and rest:
+            groups = [("istiadha", isti), ("basmala", rest)]
+        else:
+            cut = 5 if len(words) >= 9 else 0
+            groups = [("istiadha", list(words[:cut])),
+                      ("basmala", list(words[cut:]))]
+    elif has_isti:
+        groups = [("istiadha", list(words))]
+    else:
+        groups = [("basmala", list(words))]
+
+    en_openers = {op[0]: op[3] for op in OPENERS}
+    out = []
+    for kind, ws in groups:
+        if not ws:
+            continue
+        if kind == "basmala":
+            surah, ayah = 1, 1
+            disp_ar = texts_ar.get(BISMILLAH_AYAH) or _OPENER_RAW["bismillah"]
+            disp_en = texts_en.get(BISMILLAH_AYAH) or en_openers["bismillah"]
+        else:
+            surah, ayah = 1, 0
+            disp_ar = _OPENER_RAW["istiadha"]
+            disp_en = en_openers["istiadha"]
+        display = disp_ar.split()
+        row_words = []
+        for i, raw in enumerate(sorted(ws, key=lambda w: float(w.get("start") or 0.0))):
+            row_words.append(_qud_word(
+                raw.get("location"), raw.get("start"), raw.get("end"), t0,
+                display[i] if i < len(display) else "", i))
+        out.append((
+            {
+                "surah": surah,
+                "ayah": ayah,
+                "start": round(float(row_words[0]["start"]), 3),
+                "end": round(max(float(w["end"]) for w in row_words), 3),
+                "text_ar": disp_ar,
+                "text_en": disp_en,
+            },
+            row_words,
+        ))
+    if not out:
+        raise ValueError(f"QUD special {qs.get('special_type')!r} had no words")
+    return out
+
+
+def _qud_retag_leading_opener(base: list[tuple[dict, list[dict]]]) -> None:
+    """QUD has no takbir special, so a recording that opens with takbir can be
+    aligned to a canon ayah that merely contains those words. Retag ONLY the
+    first piece when its words are exactly the takbir/isti'adha — the same
+    lead-run rule the old opener injection used (mid-clip they are legit)."""
+    if not base:
+        return
+    first = min(range(len(base)), key=lambda i: float(base[i][0]["start"]))
+    seg, ws = base[first]
+    if seg.get("surah", 0) < 1 or seg.get("ayah", 0) < 1:
+        return
+    forms = [_normalize(w.get("text") or "") for w in ws]
+    for kind, canon_words, raw_ar, raw_en in OPENERS:
+        if kind == "bismillah" or forms != list(canon_words):
+            continue
+        display = raw_ar.split()
+        for i, w in enumerate(ws):
+            w["text"] = display[i] if i < len(display) else ""
+            w["_cpos"] = i
+        base[first] = (
+            dict(seg, surah=1, ayah=0, text_ar=raw_ar, text_en=raw_en),
+            ws,
+        )
+        return
+
+
+def _qud_trim_silence_overhang(segments: list[dict], silence_runs) -> list[dict]:
+    """Cut a cue back to the silence onset when its end reaches past a measured
+    breath. QUD's word durations can absorb the trailing pause into the last
+    word (measured: a 0.49 s breath at 44.25 sat inside a cue ending 44.77,
+    i.e. the previous words stayed on screen while the reciter breathed).
+    Only cues that STRADDLE the run are touched — a cue already ending before
+    it is left alone, and a start inside a run is handled by padding."""
+    if not silence_runs:
+        return segments
+    runs = sorted(silence_runs)
+    for seg in segments:
+        a, b = seg["start"], seg["end"]
+        for rs, _re in runs:
+            if b <= rs:
+                break
+            if a < rs < b:
+                seg["end"] = round(rs, 3)
+                break
+    return segments
+
+
+def segments_from_qud_alignment(
+    qud_segments: list[dict],
+    silence_runs: list | None = None,
+    raw_segs: list[tuple[float, float]] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Build caption segments straight from a QUD aligner response.
+
+    QUD already tells us WHICH words were recited and WHEN (ayah + word refs
+    and phoneme-accurate word times), so there is no detector, no chain-hole
+    filling and no VAD snapping: the display text is our canon text sliced to
+    exactly the recited words, repeats become their own captions, and a held
+    madd is already inside its word's duration (trust_times).
+
+    Returns (segments, words) where words are absolute-time {text,start,end}
+    entries in recitation order (repeats included)."""
+    from backend.providers.qud import QudUnavailable
+
+    texts_ar = load_ayah_texts()
+    texts_en = load_english_texts()
+
+    base: list[tuple[dict, list[dict]]] = []
+    words_out: list[dict] = []
+
+    try:
+        for qs in qud_segments or []:
+            if not isinstance(qs, dict):
+                continue
+            seg_words = qs.get("words") or []
+            if not seg_words:
+                continue
+            try:
+                t0 = float(qs.get("time_from") or 0.0)
+            except (TypeError, ValueError):
+                t0 = 0.0
+            kind = str(qs.get("kind") or "quran").strip().lower()
+            if kind == "special":
+                base.extend(_qud_special_pieces(
+                    qs, seg_words, t0, texts_ar, texts_en))
+                continue
+            for surah, ayah, ws in _qud_ayah_pieces(seg_words, t0, texts_ar):
+                ws.sort(key=lambda w: float(w["start"]))
+                cpos = [w["_cpos"] for w in ws]
+                text_ar, text_en = _trim_texts(
+                    texts_ar.get(f"{surah}:{ayah}") or "",
+                    texts_en.get(f"{surah}:{ayah}") or "",
+                    (min(cpos), max(cpos) + 1))
+                seg = {
+                    "surah": surah,
+                    "ayah": ayah,
+                    "start": round(float(ws[0]["start"]), 3),
+                    "end": round(max(float(w["end"]) for w in ws), 3),
+                    "text_ar": text_ar,
+                    "text_en": text_en,
+                }
+                words_out.extend(ws)
+                base.append((seg, ws))
+    except ValueError as exc:
+        raise QudUnavailable(str(exc)) from exc
+
+    if not base:
+        raise QudUnavailable("QUD returned no usable segments")
+
+    _qud_retag_leading_opener(base)
+
+    segments: list[dict] = []
+    for seg, ws in base:
+        cpos = [w.get("_cpos") for w in ws]
+        segments.extend(_phrase_split(
+            seg, ws, silence_runs, raw_segs, cpos, trust_times=True))
+    segments.sort(key=lambda s: s["start"])
+    segments = subdivide_word_cues(
+        segments, words_out, silence_runs, raw_segs, trust_times=True)
+    # A caption blanks for a BREATH, not for every 0.2-0.4 s articulation dip:
+    # a 0.38 s VAD dip inside a QUD word pulled the cue end back and left
+    # 1.18 s of recited "أَنَّهُم" with no caption (real Al-Hashr at 40.1 s).
+    breaths = [(s, e) for s, e in (silence_runs or []) if e - s >= SILENCE_SPLIT]
+    segments = _qud_trim_silence_overhang(segments, breaths)
+    segments = apply_sync_padding(segments, breaths)
+    for s in segments:
+        s.pop("_ws", None)
+    words_out.sort(key=lambda w: float(w["start"]))
+    for w in words_out:
+        w.pop("_cpos", None)
+    return segments, words_out

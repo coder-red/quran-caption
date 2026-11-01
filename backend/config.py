@@ -35,16 +35,27 @@ MAX_AUDIO_SEC = int(os.getenv("MAX_AUDIO_SEC", "1800"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.85"))
 
 # Hosted ASR backends: local (whisper fine-tuned + forced alignment) | groq |
-# gemini. groq/gemini return real word timestamps so the heavy local
-# forced-alignment stage is skipped. Default is groq (free tier, no card);
-# local is the offline fallback.
-ASR_BACKEND = os.getenv("ASR_BACKEND", "groq").strip().lower()
+# gemini | elevenlabs. groq/gemini/elevenlabs return real word timestamps so the
+# heavy local forced-alignment stage is skipped. Default is qud (phoneme-level
+# Quran aligner, no key); Groq is the automatic fallback when QUD is rate-limited.
+ASR_BACKEND = os.getenv("ASR_BACKEND", "qud").strip().lower()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip() or None
 GROQ_MODEL = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or None
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip() or None
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "scribe_v2")
+
+# QUD Quranic Universal Aligner (https://aligner.qud.dev): phoneme-level
+# alignment straight to ayah refs + word times. No API key; anonymous GPU has a
+# daily quota and the CPU pool is fair-use limited, so a failed QUD align falls
+# back to QUD_FALLBACK (groq) with the same VAD results.
+QUD_URL = os.getenv("QUD_URL", "https://aligner.qud.dev/api/v1").strip()
+QUD_DEVICE = os.getenv("QUD_DEVICE", "GPU").strip().upper()
+QUD_MODEL = os.getenv("QUD_MODEL", "Base").strip()
+QUD_RIWAYAH = os.getenv("QUD_RIWAYAH", "hafs").strip().lower()
+QUD_TIMEOUT = float(os.getenv("QUD_TIMEOUT", "900"))
+QUD_FALLBACK = os.getenv("QUD_FALLBACK", "groq").strip().lower()
 
 
 def _find_ffmpeg() -> str:
