@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import sys
 import time
@@ -103,7 +103,7 @@ def _ensure_backend():
 
 st.set_page_config(
     page_title="Quran Caption",
-    page_icon="🕌",
+    page_icon=":material/menu_book:",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -115,156 +115,262 @@ st.markdown("""
 :root {
   --gold: #D4AF37;
   --emerald: #10B981;
+  --emerald-2: #34D399;
+  --emerald-soft: rgba(16, 185, 129, 0.12);
   --bg: #0B1220;
-  --card: #141E33;
+  --card: #131D31;
+  --card-2: #17233B;
   --border: #24314D;
+  --border-soft: #1C2842;
+  --text: #E8ECF4;
   --text-dim: #8B95AB;
 }
 
-.block-container { padding-top: 1.5rem; max-width: 1200px; }
+html, body, [data-testid="stAppViewContainer"] { background: var(--bg); }
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stAppDeployButton"], [data-testid="stDecoration"] { display: none; }
 
-.hero {
-  text-align: center;
-  padding: 1.2rem 0 0.4rem;
-  margin-bottom: 1rem;
+.block-container { padding-top: 1.2rem; padding-bottom: 3.5rem; max-width: 1080px; }
+
+/* ---------- Hero ---------- */
+.hero { text-align: center; padding: 1.6rem 0 1.1rem; }
+.hero .eyebrow {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--gold);
+  opacity: 0.85;
+  margin-bottom: 0.5rem;
 }
-.hero h1 {
-  font-size: 2.6rem;
+.hero .title {
+  font-size: 2.9rem;
   font-weight: 800;
-  letter-spacing: -0.02em;
-  margin: 0;
-  background: linear-gradient(120deg, #10B981 0%, #D4AF37 60%, #F5C77E 100%);
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  background: linear-gradient(115deg, #34D399 0%, #D4AF37 62%, #F5C77E 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
-.hero p { color: var(--text-dim); font-size: 1.05rem; margin: 0.35rem 0 0; }
+.hero .lede {
+  color: var(--text-dim);
+  font-size: 1rem;
+  margin: 0.55rem auto 0;
+  max-width: 34rem;
+}
 
-.card {
-  background: var(--card);
+/* ---------- Cards (st.container(key="card_*")) ---------- */
+div[data-testid="stVerticalBlock"]:is([class*="st-key-card_"]) {
+  background: linear-gradient(180deg, #131D31 0%, #111A2C 100%);
   border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 1.1rem 1.2rem;
-  margin: 0.6rem 0;
+  border-radius: 18px;
+  padding: 1.15rem 1.2rem 1.1rem;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.26);
 }
-.card h3 { margin: 0 0 0.4rem; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem; }
-.card .step-badge {
-  background: var(--emerald);
-  color: #04160F;
-  font-weight: 800;
-  font-size: 0.75rem;
-  border-radius: 999px;
-  padding: 0.1rem 0.6rem;
-}
-.dim { color: var(--text-dim); font-size: 0.85rem; }
 
-.conf-bar {
-  height: 8px;
+/* ---------- Card section headers ---------- */
+.sec { display: flex; align-items: center; gap: 0.7rem; margin: 0 0 0.85rem; }
+.sec .n {
+  width: 1.85rem; height: 1.85rem; flex: none;
+  display: grid; place-items: center;
+  border-radius: 0.62rem;
+  font-size: 0.85rem; font-weight: 800; color: #04160F;
+  background: linear-gradient(150deg, #34D399, #10B981);
+  box-shadow: 0 0 0 1px rgba(16,185,129,0.4), 0 6px 16px rgba(16,185,129,0.2);
+}
+.sec .txt { min-width: 0; }
+.sec .txt .h { font-size: 1.06rem; font-weight: 700; letter-spacing: -0.01em; line-height: 1.25; }
+.sec .txt .sub { color: var(--text-dim); font-size: 0.82rem; margin-top: 0.12rem; line-height: 1.35; }
+.sec .tag {
+  margin-left: auto; flex: none;
+  font-size: 0.64rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  background: #24314D;
+  padding: 0.2rem 0.6rem;
+  white-space: nowrap;
+}
+
+.subhead {
+  font-size: 0.68rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 1.1rem 0 0.45rem;
+}
+
+/* ---------- Detection summary ---------- */
+.det-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap;
+}
+.det-sura-ar { font-size: 2rem; font-weight: 700; line-height: 1.35; direction: rtl; }
+.det-sura-en { color: var(--text-dim); font-size: 0.88rem; margin-top: 0.1rem; }
+.det-side { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; }
+.det-ok {
+  font-size: 0.64rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.engine-chip {
+  font-size: 0.64rem; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--emerald-2);
+  background: var(--emerald-soft);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  border-radius: 999px;
+  padding: 0.22rem 0.6rem;
+}
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.55rem; margin: 1rem 0 0.85rem; }
+.stat {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 0.6rem 0.4rem;
+  text-align: center;
+}
+.stat .v { font-size: 1.22rem; font-weight: 750; line-height: 1.2; }
+.stat .l {
+  font-size: 0.6rem; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--text-dim); margin-top: 0.18rem;
+}
+.conf-bar {
+  height: 6px; border-radius: 999px; background: var(--border);
   overflow: hidden;
-  margin: 0.4rem 0 0.2rem;
 }
 .conf-fill {
-  height: 100%;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #10B981, #D4AF37);
+  height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--emerald), var(--gold));
 }
 
-.surah-name-ar {
-  font-size: 1.9rem;
-  font-weight: 700;
-  direction: rtl;
-  line-height: 1.5;
-  margin: 0.15rem 0;
-}
-.surah-name-en {
-  font-size: 1rem;
-  color: var(--text-dim);
-  margin-bottom: 0.4rem;
-}
-.metric-row { display: flex; gap: 2rem; margin: 0.6rem 0; }
-.metric { text-align: center; }
-.metric .v { font-size: 1.5rem; font-weight: 700; }
-.metric .l { font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
-
-div[data-testid="stFileUploaderDropzone"] {
-  background: var(--card);
-  border: 1.5px dashed #3A4A6E;
+/* ---------- Uploader ---------- */
+section[data-testid="stFileUploaderDropzone"] {
+  background: rgba(255, 255, 255, 0.015);
+  border: 1.5px dashed #33436199;
   border-radius: 14px;
-  padding: 1.6rem;
+  padding: 1.4rem 1.1rem;
+  transition: border-color 120ms ease, background 120ms ease;
 }
-div[data-testid="stFileUploaderDropzone"]:hover { border-color: var(--emerald); }
-div[data-testid="stFileUploaderDropzone"] button {
-  background: var(--emerald);
-  color: #04160F;
-  font-weight: 700;
-  border-radius: 8px;
+section[data-testid="stFileUploaderDropzone"]:hover {
+  border-color: rgba(16, 185, 129, 0.65);
+  background: rgba(16, 185, 129, 0.04);
 }
-
-.stButton > button[kind="primary"] {
+section[data-testid="stFileUploaderDropzone"] button {
   background: var(--emerald);
   color: #04160F;
   font-weight: 700;
   border: none;
+  border-radius: 9px;
+  padding: 0.5rem 1rem;
+}
+section[data-testid="stFileUploaderDropzone"] button:hover { background: var(--emerald-2); }
+div[data-testid="stFileUploaderDropzoneInstructions"] div { color: var(--text-dim); }
+div[data-testid="stFileUploaderDropzoneInstructions"] span { color: var(--text); }
+
+/* ---------- Buttons ---------- */
+.stButton > button, .stDownloadButton > button {
   border-radius: 10px;
+  font-weight: 650;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 120ms ease, background 120ms ease, transform 60ms ease;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+  border-color: rgba(16, 185, 129, 0.6);
+  background: rgba(16, 185, 129, 0.07);
+}
+.stButton > button:active, .stDownloadButton > button:active { transform: translateY(1px); }
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+  background: linear-gradient(135deg, #34D399, #10B981);
+  color: #04160F;
+  font-weight: 800;
+  border: none;
   padding: 0.55rem 1.2rem;
 }
-.stButton > button[kind="primary"]:hover { background: #34D399; color: #04160F; }
-.stButton > button {
-  border-radius: 10px;
-  font-weight: 600;
+.stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {
+  background: linear-gradient(135deg, #6EE7B7, #34D399);
+  color: #04160F;
 }
 
-div[data-testid="stProgressBar"] > div > div { background: linear-gradient(90deg, #10B981, #D4AF37); }
+/* ---------- Selectable chips ---------- */
+button[data-testid^="stBaseButton-segmented_control"],
+button[data-testid^="stBaseButton-pills"] {
+  border-radius: 999px !important;
+  border: 1px solid var(--border) !important;
+  background: transparent !important;
+  color: var(--text) !important;
+  font-weight: 600 !important;
+}
+button[data-testid="stBaseButton-segmented_controlActive"],
+button[data-testid="stBaseButton-pillsActive"] {
+  background: var(--emerald-soft) !important;
+  border-color: rgba(16, 185, 129, 0.55) !important;
+  color: var(--emerald-2) !important;
+}
+div[data-testid="stPills"] { flex-wrap: wrap; }
 
-.stExpander { border: 1px solid var(--border) !important; border-radius: 12px !important; background: var(--card); }
+/* ---------- Progress / expanders / tables ---------- */
+div[data-testid="stProgressBar"] > div > div {
+  background: linear-gradient(90deg, var(--emerald), var(--gold));
+}
+div[data-testid="stExpander"] details {
+  background: var(--card-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+}
+div[data-testid="stExpander"] summary { border-radius: 12px; }
+div[data-testid="stDataFrame"] { border-radius: 10px; overflow-x: auto; }
 
-/* ---------- Mobile responsiveness ---------- */
-/* Streamlit columns stay side-by-side and squeeze on phones by default;
-   wrap them so language/style/download panels stack instead of crushing. */
+/* ---------- Caption player ---------- */
+#capwrap { box-shadow: 0 18px 44px rgba(0, 0, 0, 0.4); }
+#fsbtn { min-height: 44px; min-width: 44px; }
+
+/* ---------- Mobile ---------- */
 div[data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
 div[data-testid="stHorizontalBlock"] > div[data-testid="column"] { min-width: 240px; flex: 1 1 240px; }
-/* Pills / segmented controls: wrap instead of horizontal overflow */
-div[data-testid="stPills"], div[data-baseweb="segmented-control"] { flex-wrap: wrap; }
-/* Caption player: keep 16:9 but cap height on short screens so controls stay visible */
-#capwrap { max-height: 72vh; }
-#capwrap video { max-height: 72vh; object-fit: contain; background: #000; }
-/* Sticky mini-player: stays pinned while scrolling the ayah table on long surahs */
-div[data-testid="stHtml"] { position: sticky; top: 0.5rem; z-index: 50; }
-div[data-testid="stHtml"] #capwrap { box-shadow: 0 8px 32px rgba(0,0,0,0.55); }
-/* Fullscreen button needs a 44px touch target on mobile */
-#fsbtn { min-height: 44px; min-width: 44px; }
-/* Data editor: allow horizontal scroll on narrow screens */
-div[data-testid="stDataFrame"] { overflow-x: auto; }
 
 @media (max-width: 768px) {
-  .block-container { padding: 0.8rem 0.8rem 2rem; }
-  .hero { padding: 0.6rem 0 0.2rem; }
-  .hero h1 { font-size: 1.7rem; }
-  .hero p { font-size: 0.9rem; }
-  .card { padding: 0.8rem 0.85rem; border-radius: 12px; }
-  .metric-row { gap: 1rem; flex-wrap: wrap; justify-content: space-around; }
-  .metric .v { font-size: 1.15rem; }
-  .surah-name-ar { font-size: 1.5rem; }
-  div[data-testid="stFileUploaderDropzone"] { padding: 1rem; }
-  /* Single-column stacking for editor panels */
-  div[data-testid="stHorizontalBlock"] > div[data-testid="column"] { min-width: 100%; flex-basis: 100%; }
-  .stButton > button { width: 100%; min-height: 48px; font-size: 1rem; }
-  #cap { left: 2%; right: 2%; }
-  /* Sticky player sits closer to the viewport top on phones */
-  div[data-testid="stHtml"] { top: 0.25rem; }
-  #capwrap { border-radius: 10px; }
-  /* Sliders / controls get full-width touch-friendly rows */
-  div[data-testid="stSlider"] { padding: 0.4rem 0; }
+  .block-container { padding: 0.8rem 0.8rem 3rem; }
+  .hero { padding: 0.9rem 0 0.6rem; }
+  .hero .title { font-size: 2.15rem; }
+  .hero .lede { font-size: 0.9rem; }
+  div[data-testid="stVerticalBlock"]:is([class*="st-key-card_"]) {
+    padding: 0.95rem 0.9rem 0.95rem;
+    border-radius: 15px;
+  }
+  .sec { gap: 0.55rem; }
+  .sec .txt .h { font-size: 1rem; }
+  .sec .tag { display: none; }
+  .stats { gap: 0.4rem; }
+  .stat { padding: 0.5rem 0.25rem; }
+  .stat .v { font-size: 1.02rem; }
+  .stat .l { font-size: 0.55rem; }
+  .det-sura-ar { font-size: 1.6rem; }
+  .det-side { align-items: flex-start; }
+  div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+    min-width: 100%; flex-basis: 100%;
+  }
+  .stButton > button, .stDownloadButton > button { min-height: 46px; }
+  section[data-testid="stFileUploaderDropzone"] { padding: 1rem 0.8rem; }
+  /* Only on phones: pin the player while scrolling the controls below it.
+     The element container is the right sticky box — a keyed card wrapper is
+     exactly as tall as its content and gives sticky no scroll room. */
+  div[data-testid="stElementContainer"]:has(#capwrap) {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    padding: 0.3rem 0;
+    background: var(--bg);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  }
+  div[data-testid="stSlider"] { padding: 0.35rem 0; }
 }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="hero">
-  <h1>📖 Quran Caption</h1>
-  <p>Upload a video — Quran captions, synced ayah by ayah.</p>
+  <div class="eyebrow">Quran Caption Studio</div>
+  <div class="title">Quran Caption</div>
+  <div class="lede">Upload a recitation and get ayah-accurate captions you can
+  style, verify against the audio, and burn into the video.</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -320,6 +426,8 @@ ss.setdefault("media_url", None)
 ss.setdefault("media_uploaded", False)
 ss.setdefault("render_job_id", None)
 ss.setdefault("render_started", None)
+ss.setdefault("render_bytes", None)
+ss.setdefault("render_name", None)
 # media_id of the video, uploaded separately at the burn-in step when the
 # recitation itself was an audio file (captions still need something to burn
 # into).
@@ -799,248 +907,317 @@ def ensure_video_preview():
             ss["preview_video_uri"] = url
 
 
-def show_detection(result: dict):
-    surah = result["surah"]
-    conf = result["confidence"]
-    n_ayahs = max(0, result["end_ayah"] - result["start_ayah"] + 1)
+def section_header(num: str, title: str, sub: str = "", tag: str = "") -> None:
+    tag_html = f'<span class="tag">{tag}</span>' if tag else ""
+    sub_html = f'<div class="sub">{sub}</div>' if sub else ""
     st.markdown(
-        f"""
-        <div class="card">
-          <h3><span class="step-badge">✓</span> Detected Surah</h3>
-          <div class="surah-name-ar">{surah['name_ar']}</div>
-          <div class="surah-name-en">{surah['name_en']} (Surah {surah['id']})</div>
-          <div class="metric-row">
-            <div class="metric"><div class="v">{result['start_ayah']}–{result['end_ayah']}</div><div class="l">Ayahs · {n_ayahs} total</div></div>
-            <div class="metric"><div class="v">{len(result['segments'])}</div><div class="l">Synced segments</div></div>
-            <div class="metric"><div class="v">{conf:.0%}</div><div class="l">Confidence{(' · ' + result['engine'].upper()) if result.get('engine') else ''}</div></div>
-          </div>
-          <div class="conf-bar"><div class="conf-fill" style="width:{min(100, conf*100):.0f}%"></div></div>
-        </div>
-        """,
+        f'<div class="sec"><span class="n">{num}</span>'
+        f'<div class="txt"><div class="h">{title}</div>{sub_html}</div>'
+        f'{tag_html}</div>',
         unsafe_allow_html=True,
     )
-    if result.get("engine_note"):
-        st.caption(f"Alignment note — {result['engine_note']}")
+
+
+def show_detection(result: dict):
+    surah = result["surah"]
+    conf = float(result["confidence"])
+    n_ayahs = max(0, result["end_ayah"] - result["start_ayah"] + 1)
+    engine = (result.get("engine") or "").upper()
+    chip = f'<span class="engine-chip">{engine}</span>' if engine else ""
+    with st.container(border=True, key="card_detected"):
+        st.markdown(
+            f"""
+            <div class="det">
+              <div class="det-head">
+                <div>
+                  <div class="det-sura-ar" dir="rtl">{surah['name_ar']}</div>
+                  <div class="det-sura-en">{surah['name_en']} · Surah {surah['id']}</div>
+                </div>
+                <div class="det-side">{chip}<div class="det-ok">Captions ready</div></div>
+              </div>
+              <div class="stats">
+                <div class="stat"><div class="v">{result['start_ayah']}–{result['end_ayah']}</div><div class="l">{n_ayahs} ayahs</div></div>
+                <div class="stat"><div class="v">{len(result['segments'])}</div><div class="l">Cues</div></div>
+                <div class="stat"><div class="v">{conf:.0%}</div><div class="l">Confidence</div></div>
+              </div>
+              <div class="conf-bar"><div class="conf-fill" style="width:{max(0.0, min(100.0, conf * 100)):.0f}%"></div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if result.get("engine_note"):
+            st.caption(f"Engine note — {result['engine_note']}")
 
 
 # ---------------------------------------------------------------- Step 1: upload
-st.markdown('<div class="card"><h3><span class="step-badge">1</span> Upload recitation</h3></div>', unsafe_allow_html=True)
-
-uploaded = st.file_uploader(
-    "Choose a video — or an audio file",
-    type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a", "ogg"],
-    label_visibility="collapsed",
-    key="file_uploader",
-)
-if _PROXY_JS.strip():
-    st.html(f"<script>{_PROXY_JS}</script>", unsafe_allow_javascript=True)
-if uploaded is not None:
-    if uploaded.size > MAX_SIZE:
-        st.error(f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — trim long recordings before uploading on mobile.")
-        st.stop()
-    is_new = (
-        ss["file_meta"] is None
-        or uploaded.name != ss["file_meta"].get("name")
-        or getattr(uploaded, "file_id", None) != ss["file_meta"].get("file_id")
-    )
-    if is_new:
-        prune_static([ss.get("media_id"), ss.get("video_media_id")])
-        ss["file_bytes"] = uploaded.getvalue()
-        ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
-        ss["align_result"] = None
-        ss["segments"] = None
-        ss["sync_live"] = False
-        ss["sync_payload"] = None
-        ss["sync_sig"] = None
-        ss["lang"] = "ar"
-        ss["render_job_id"] = None
-        ss["media_id"] = uuid.uuid4().hex[:10]
-        ss["media_url"] = None
-        ss["media_uploaded"] = False
-        ss["video_media_id"] = None
-        ss["video_uploaded"] = False
-        ss["video_meta"] = None
-        ss["preview_video_uri"] = None
-        ss["preview_video_tried"] = False
-    if source_is_video():
-        st.caption(
-            f"Video received: **{source_video_name()}** — only its soundtrack "
-            "was sent ahead so captions can start now. The picture uploads "
-            "next for the burn-in, and the MP4 keeps your video."
+if ss["align_result"] is None:
+    with st.container(border=True, key="card_upload"):
+        section_header(
+            "1", "Upload recitation",
+            "A video or audio recording — captions are aligned to the Quran text.",
+            "step 1 of 3",
         )
 
-if (ss["file_bytes"] is not None or ss.get("media_uploaded")) and ss["align_result"] is None:
-    if ss["file_bytes"] is not None:
-        if source_is_video():
-            st.caption("Soundtrack ready to caption — your picture is uploaded with the burn-in below.")
-        else:
-            st.video(ss["file_bytes"])
-    else:
-        # Bytes were dropped after upload to save RAM; the server copy is
-        # reused, so just offer Generate again (e.g. after a failed run).
-        st.info("File is already on the caption engine — press Generate Captions to (re)run.")
+        uploaded = st.file_uploader(
+            "Choose a video — or an audio file",
+            type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a", "ogg"],
+            label_visibility="collapsed",
+            key="file_uploader",
+        )
+        if _PROXY_JS.strip():
+            st.html(f"<script>{_PROXY_JS}</script>", unsafe_allow_javascript=True)
 
-    generate = st.button("Generate Captions", type="primary", use_container_width=True)
-    if generate:
-        if not ss.get("media_id"):
-            ss["media_id"] = uuid.uuid4().hex[:10]
-        with st.status("Running speech recognition + surah detection…", expanded=True) as status:
-            try:
-                # Upload ONCE: the file goes to /media, then /align reuses
-                # that server-side copy via media_id (no second upload).
-                if not ss.get("media_uploaded"):
-                    status.update(label="Uploading file (once)…", state="running")
-                    payload = media_bytes()
-                    if payload is None:
-                        st.error("Upload failed: file bytes unavailable — re-select the file.")
-                        st.stop()
-                    up = post_media(
-                        ss["media_id"], ss["file_meta"]["name"], payload,
-                        ss["file_meta"]["type"],
-                    )
-                    if up.status_code != 200:
-                        st.error(f"Upload failed: {api_error(up)}")
-                        st.stop()
-                    ss["media_uploaded"] = True
-                    drop_media_bytes()
-                resp = requests.post(
-                    f"{API_URL}/align",
-                    # Engine is chosen server-side (ASR_BACKEND env) — no UI
-                    # override, so the form field is omitted entirely.
-                    data={"job": "1", "media_id": ss["media_id"]},
-                    timeout=120,
+        if uploaded is not None:
+            if uploaded.size > MAX_SIZE:
+                st.error(
+                    f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — "
+                    "trim long recordings before uploading on mobile."
                 )
-            except requests.RequestException as e:
-                st.error(f"Could not reach the caption engine: {e}")
                 st.stop()
-            if resp.status_code != 200:
-                st.error(f"API error {resp.status_code}: {api_error(resp)}")
-                st.stop()
-            jid = resp.json()["job_id"]
-            prog = st.progress(0, text="Queued…")
-            # A dead engine used to spin here forever (every poll raised
-            # RequestException -> continue) behind a frozen bar. Count
-            # consecutive misses and bail out with a real message instead.
-            misses, started, last_pct = 0, time.time(), 0
-            while True:
-                time.sleep(0.8)
-                try:
-                    job = requests.get(f"{API_URL}/align/status/{jid}", timeout=15).json()
-                    misses = 0
-                except (requests.RequestException, ValueError):
-                    misses += 1
-                    elapsed = int(time.time() - started)
-                    prog.progress(
-                        last_pct,
-                        text=f"Reconnecting… ({misses}/5) · {elapsed}s elapsed",
-                    )
-                    if misses >= 5:
-                        prog.empty()
-                        status.update(label="Engine unreachable", state="error")
-                        st.error(
-                            "Lost contact with the caption engine after "
-                            f"{elapsed}s (it may have crashed). Press Generate "
-                            "Captions to retry once the engine is back up."
-                        )
-                        st.stop()
-                    continue
-                pct = job.get("progress", 0)
-                last_pct = min(99, int(pct))
-                prog.progress(
-                    last_pct,
-                    text=f"{job.get('stage', 'working…')} · {pct:.0f}% · "
-                         f"{int(time.time() - started)}s elapsed",
+            is_new = (
+                ss["file_meta"] is None
+                or uploaded.name != ss["file_meta"].get("name")
+                or getattr(uploaded, "file_id", None) != ss["file_meta"].get("file_id")
+            )
+            if is_new:
+                prune_static([ss.get("media_id"), ss.get("video_media_id")])
+                ss["file_bytes"] = uploaded.getvalue()
+                ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
+                ss["align_result"] = None
+                ss["segments"] = None
+                ss["sync_live"] = False
+                ss["sync_payload"] = None
+                ss["sync_sig"] = None
+                ss["lang"] = "ar"
+                ss["render_job_id"] = None
+                ss["render_bytes"] = None
+                ss["render_name"] = None
+                ss["media_id"] = uuid.uuid4().hex[:10]
+                ss["media_url"] = None
+                ss["media_uploaded"] = False
+                ss["video_media_id"] = None
+                ss["video_uploaded"] = False
+                ss["video_meta"] = None
+                ss["preview_video_uri"] = None
+                ss["preview_video_tried"] = False
+            if source_is_video():
+                st.caption(
+                    f"Video received: **{source_video_name()}** — only its soundtrack "
+                    "was sent ahead so captions can start now. The picture uploads "
+                    "next for the burn-in, and the MP4 keeps your video."
                 )
-                status.update(label=job.get("stage", "working…"))
-                if job.get("status") == "error":
-                    # /align/status carries no message — fetch it from the
-                    # result endpoint (now surfaces the real job error).
-                    msg = None
+
+        has_file = ss["file_bytes"] is not None or ss.get("media_uploaded")
+        if has_file:
+            if ss["file_bytes"] is not None:
+                _type = (ss.get("file_meta") or {}).get("type") or ""
+                if _type.startswith("video/"):
+                    st.video(ss["file_bytes"])
+                elif not source_is_video():
+                    st.audio(ss["file_bytes"])
+            else:
+                # Bytes were dropped after upload to save RAM; the server copy
+                # is reused, so just offer Generate again (e.g. after a failure).
+                st.info("This file is already on the caption engine — generate captions, or pick another file.")
+
+            generate = st.button(
+                "Generate captions", type="primary", width="stretch",
+                icon=":material/auto_awesome:",
+            )
+            if generate:
+                if not ss.get("media_id"):
+                    ss["media_id"] = uuid.uuid4().hex[:10]
+                with st.status("Running speech recognition + surah detection…", expanded=False) as status:
                     try:
-                        msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
-                    except (requests.RequestException, ValueError):
-                        msg = None
-                    prog.empty()
-                    status.update(label="Failed", state="error")
-                    st.error(f"Align failed: {msg or 'unknown error'}")
-                    st.stop()
-                if job.get("status") == "done":
-                    break
-            try:
-                data = requests.get(f"{API_URL}/align/result/{jid}", timeout=60).json()
-            except requests.RequestException as e:
-                st.error(f"Could not fetch the result: {e}")
-                st.stop()
-            if "error" in data:
-                st.error(f"Could not identify the surah: {data['error']}")
-                st.stop()
-            ss["align_result"] = data
-            ss["segments"] = [dict(s) for s in data["segments"]]
-            # A new align means new evidence: drop the old inspector payload.
-            ss["sync_live"] = False
-            ss["sync_payload"] = None
-            ss["sync_sig"] = None
-            prog.progress(100, text="Done · captions ready")
-            status.update(label="Surah detected!", state="complete")
+                        # Upload ONCE: the file goes to /media, then /align
+                        # reuses that server-side copy via media_id (no second
+                        # upload).
+                        if not ss.get("media_uploaded"):
+                            status.update(label="Uploading file (once)…", state="running")
+                            payload = media_bytes()
+                            if payload is None:
+                                st.error("Upload failed: file bytes unavailable — re-select the file.")
+                                st.stop()
+                            up = post_media(
+                                ss["media_id"], ss["file_meta"]["name"], payload,
+                                ss["file_meta"]["type"],
+                            )
+                            if up.status_code != 200:
+                                st.error(f"Upload failed: {api_error(up)}")
+                                st.stop()
+                            ss["media_uploaded"] = True
+                            drop_media_bytes()
+                        resp = requests.post(
+                            f"{API_URL}/align",
+                            # Engine is chosen server-side (ASR_BACKEND env) —
+                            # no UI override, so the form field is omitted.
+                            data={"job": "1", "media_id": ss["media_id"]},
+                            timeout=120,
+                        )
+                    except requests.RequestException as e:
+                        st.error(f"Could not reach the caption engine: {e}")
+                        st.stop()
+                    if resp.status_code != 200:
+                        st.error(f"API error {resp.status_code}: {api_error(resp)}")
+                        st.stop()
+                    jid = resp.json()["job_id"]
+                    prog = st.progress(0, text="Queued…")
+                    # A dead engine used to spin here forever (every poll
+                    # raised RequestException -> continue) behind a frozen
+                    # bar. Count consecutive misses and bail out with a real
+                    # message instead.
+                    misses, started, last_pct = 0, time.time(), 0
+                    while True:
+                        time.sleep(0.8)
+                        try:
+                            job = requests.get(f"{API_URL}/align/status/{jid}", timeout=15).json()
+                            misses = 0
+                        except (requests.RequestException, ValueError):
+                            misses += 1
+                            elapsed = int(time.time() - started)
+                            prog.progress(
+                                last_pct,
+                                text=f"Reconnecting… ({misses}/5) · {elapsed}s elapsed",
+                            )
+                            if misses >= 5:
+                                prog.empty()
+                                status.update(label="Engine unreachable", state="error")
+                                st.error(
+                                    "Lost contact with the caption engine after "
+                                    f"{elapsed}s (it may have crashed). Press "
+                                    "Generate captions to retry once the engine "
+                                    "is back up."
+                                )
+                                st.stop()
+                            continue
+                        pct = job.get("progress", 0)
+                        last_pct = min(99, int(pct))
+                        prog.progress(
+                            last_pct,
+                            text=f"{job.get('stage', 'working…')} · {pct:.0f}% · "
+                                 f"{int(time.time() - started)}s elapsed",
+                        )
+                        status.update(label=job.get("stage", "working…"))
+                        if job.get("status") == "error":
+                            # /align/status carries no message — fetch it from
+                            # the result endpoint (now surfaces the real job
+                            # error).
+                            msg = None
+                            try:
+                                msg = requests.get(f"{API_URL}/align/result/{jid}", timeout=30).json().get("error")
+                            except (requests.RequestException, ValueError):
+                                msg = None
+                            prog.empty()
+                            status.update(label="Failed", state="error")
+                            st.error(f"Align failed: {msg or 'unknown error'}")
+                            st.stop()
+                        if job.get("status") == "done":
+                            break
+                    try:
+                        data = requests.get(f"{API_URL}/align/result/{jid}", timeout=60).json()
+                    except requests.RequestException as e:
+                        st.error(f"Could not fetch the result: {e}")
+                        st.stop()
+                    if "error" in data:
+                        st.error(f"Could not identify the surah: {data['error']}")
+                        st.stop()
+                    ss["align_result"] = data
+                    ss["segments"] = [dict(s) for s in data["segments"]]
+                    # A new align means new evidence: drop the old inspector payload.
+                    ss["sync_live"] = False
+                    ss["sync_payload"] = None
+                    ss["sync_sig"] = None
+                    prog.progress(100, text="Done · captions ready")
+                    status.update(label="Surah detected — captions ready", state="complete")
+                # The upload card belongs to the pre-align state; rerun so the
+                # result view replaces it instead of stacking below it.
+                st.rerun()
 
-    if ss["align_result"] is not None:
-        show_detection(ss["align_result"])
-
-# ---------------------------------------------------------------- Step 2: sync & preview editor
+# ---------------------------------------------------------------- Step 2: preview & style
 if ss["align_result"] is not None and ss["segments"]:
+    show_detection(ss["align_result"])
     ensure_media()
     ensure_video_preview()
 
-    st.markdown('<div class="card"><h3><span class="step-badge">2</span> Sync & preview</h3></div>', unsafe_allow_html=True)
-    st.caption("Overlay preview — captions are saved only in the rendered MP4 below.")
-    if source_is_video() and not ss.get("video_uploaded"):
-        st.caption(
-            "Your video is still uploading — the preview plays its soundtrack "
-            "for now and switches to the picture automatically when it lands."
+    with st.container(border=True, key="card_preview"):
+        section_header(
+            "2", "Preview & style",
+            "The overlay is a preview — burn it into the video at the export step.",
+            "step 2 of 3",
         )
-
-    # Full-width stacked controls: the old 3-column row ([2,1,2] with an
-    # empty spacer) squeezed to unreadable widths on phones. One control
-    # per row wraps cleanly on both desktop and mobile.
-    lang = st.segmented_control(
-        "Caption language",
-        options=["ar", "en", "both"],
-        format_func=lambda x: LANGS[x],
-        default=ss["lang"],
-        key="lang_control",
-    )
-    if lang != ss["lang"]:
-        ss["lang"] = lang
-
-    chosen = st.pills(
-        "Style preset",
-        options=list(PRESETS.keys()),
-        default=ss["preset"],
-        label_visibility="collapsed",
-        key="preset_pills",
-    )
-    if chosen and chosen != ss["preset"]:
-        ss["preset"] = chosen
-        ss["styles"] = dict(PRESETS[chosen])
-
-    with st.expander("Customize style", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            ss["styles"]["font_size"] = st.slider("Font size", 24, 120, ss["styles"]["font_size"], 2)
-            ss["styles"]["font_color"] = st.color_picker("Text color", ss["styles"]["font_color"])
-            ss["styles"]["outline_color"] = st.color_picker("Outline color", ss["styles"]["outline_color"])
-            ss["styles"]["bold"] = st.toggle("Bold", ss["styles"]["bold"])
-        with c2:
-            ss["styles"]["font_family"] = st.selectbox(
-                "Font family", ["Segoe UI", "Tahoma", "Arial", "Times New Roman", "Calibri"],
-                index=["Segoe UI", "Tahoma", "Arial", "Times New Roman", "Calibri"].index(ss["styles"]["font_family"]),
+        if source_is_video() and not ss.get("video_uploaded"):
+            st.caption(
+                "Your video is still uploading — the preview plays its soundtrack "
+                "for now and switches to the picture automatically when it lands."
             )
-            ss["styles"]["outline_size"] = st.slider("Outline width", 0, 6, ss["styles"]["outline_size"])
-            ss["styles"]["shadow_size"] = st.slider("Shadow", 0, 5, ss["styles"]["shadow_size"])
-            ss["styles"]["box"] = st.toggle("Solid background box", ss["styles"]["box"])
-            ss["styles"]["position"] = st.segmented_control(
-                "Position", ["bottom", "middle", "top"], default=ss["styles"]["position"]
-            )
+
+        lang = st.segmented_control(
+            "Caption language",
+            options=["ar", "en", "both"],
+            format_func=lambda x: LANGS[x],
+            default=ss["lang"] or "ar",
+            key="lang_control",
+            width="stretch",
+        )
+        if lang and lang != ss["lang"]:
+            ss["lang"] = lang
+
+        chosen = st.pills(
+            "Style preset",
+            options=list(PRESETS.keys()),
+            default=ss["preset"],
+            key="preset_pills",
+            width="stretch",
+        )
+        if chosen and chosen != ss["preset"]:
+            ss["preset"] = chosen
+            ss["styles"] = dict(PRESETS[chosen])
+
+        with st.expander("Fine-tune style", icon=":material/tune:", key="exp_style"):
+            # Widget keys include the preset: picking a preset must remount
+            # the controls with the preset's values (widget state otherwise
+            # outlives a changed default).
+            _pk = ss["preset"].replace(" ", "_").lower()
+            c1, c2 = st.columns(2)
+            with c1:
+                ss["styles"]["font_size"] = st.slider(
+                    "Font size", 24, 120, ss["styles"]["font_size"], 2,
+                    key=f"style_fs_{_pk}",
+                )
+                ss["styles"]["font_color"] = st.color_picker(
+                    "Text color", ss["styles"]["font_color"], key=f"style_fc_{_pk}",
+                )
+                ss["styles"]["outline_color"] = st.color_picker(
+                    "Outline color", ss["styles"]["outline_color"], key=f"style_oc_{_pk}",
+                )
+                ss["styles"]["bold"] = st.toggle(
+                    "Bold", ss["styles"]["bold"], key=f"style_bold_{_pk}",
+                )
+            with c2:
+                ss["styles"]["font_family"] = st.selectbox(
+                    "Font family",
+                    ["Segoe UI", "Tahoma", "Arial", "Times New Roman", "Calibri"],
+                    index=["Segoe UI", "Tahoma", "Arial", "Times New Roman", "Calibri"].index(
+                        ss["styles"]["font_family"]
+                    ),
+                    key=f"style_ff_{_pk}",
+                )
+                ss["styles"]["outline_size"] = st.slider(
+                    "Outline width", 0, 6, ss["styles"]["outline_size"],
+                    key=f"style_ow_{_pk}",
+                )
+                ss["styles"]["shadow_size"] = st.slider(
+                    "Shadow", 0, 5, ss["styles"]["shadow_size"],
+                    key=f"style_sh_{_pk}",
+                )
+                ss["styles"]["box"] = st.toggle(
+                    "Solid background box", ss["styles"]["box"], key=f"style_box_{_pk}",
+                )
+                ss["styles"]["position"] = st.segmented_control(
+                    "Position", ["bottom", "middle", "top"],
+                    default=ss["styles"]["position"],
+                    key=f"style_pos_{_pk}",
+                ) or ss["styles"]["position"]
 
     src = ss.get("preview_video_uri") or ss["media_url"]
     if src:
@@ -1052,14 +1229,218 @@ if ss["align_result"] is not None and ss["segments"]:
             unsafe_allow_javascript=True,
         )
 
-    with st.expander("🔍 Sync inspector", expanded=False):
+    # ---------------------------------------------------------------- Step 3: export
+    with st.container(border=True, key="card_export"):
+        section_header(
+            "3", "Export",
+            "Take the subtitles as files, or burn them into the video.",
+            "step 3 of 3",
+        )
+        srt_content = srt_from_segments(ss["segments"], ss["lang"])
+
+        st.markdown('<div class="subhead">Subtitle files</div>', unsafe_allow_html=True)
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                "Download SRT",
+                data=srt_content.encode("utf-8"),
+                file_name=f"captions_{ss['lang']}.srt",
+                mime="application/x-subrip",
+                width="stretch",
+                icon=":material/subtitles:",
+            )
+        with dl2:
+            st.download_button(
+                "Download VTT",
+                data=vtt_from_srt(srt_content).encode("utf-8"),
+                file_name=f"captions_{ss['lang']}.vtt",
+                mime="text/vtt",
+                width="stretch",
+                icon=":material/closed_caption:",
+            )
+        st.caption("Files follow the caption language selected above.")
+
+        st.markdown('<div class="subhead">Burn into the video</div>', unsafe_allow_html=True)
+        res_label = st.selectbox("Output resolution", list(RESOLUTIONS.keys()), index=0)
+        res_w, res_h = RESOLUTIONS[res_label]
+
+        # An audio upload has no picture to burn the captions into, so the
+        # matching video is asked for here (once, at render time). A video
+        # picked in step 1 arrives as its soundtrack first
+        # (frontend/auto_proxy.js) and is auto-filled here in the background —
+        # that upload is the picture the MP4 must use, never the proxy.
+        _meta = ss.get("file_meta") or {}
+        _name = (_meta.get("name") or "").lower()
+        _audio_only = (_meta.get("type") or "").startswith("audio/") or _name.endswith(
+            (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
+        )
+        _from_video = source_is_video()
+        if _audio_only:
+            if _from_video:
+                if not ss.get("video_uploaded"):
+                    st.info(
+                        "Sending your video to the caption engine in the background. "
+                        "You can keep editing — rendering unlocks as soon as it lands."
+                    )
+                else:
+                    st.caption(f"Video: {source_video_name()}")
+            else:
+                st.caption("The video the captions are burned into.")
+            _vfile = st.file_uploader(
+                "Video for the burned-in MP4",
+                type=["mp4", "webm", "mov", "avi", "mkv"],
+                label_visibility="collapsed",
+                # A new clip gets a fresh widget, so the previous clip's video
+                # can never be rendered under the new captions.
+                key=f"video_uploader_{ss['media_id']}",
+            )
+            if _vfile is not None:
+                if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
+                    ss["video_media_id"] = uuid.uuid4().hex[:10]
+                    ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
+                    ss["preview_video_uri"] = None
+                    ss["preview_video_tried"] = False
+                if not ss.get("video_uploaded"):
+                    try:
+                        with st.spinner("Uploading the original video…"):
+                            up = post_media(
+                                ss["video_media_id"], _vfile.name, _vfile, _vfile.type
+                            )
+                        if up.status_code != 200:
+                            st.error(f"Video upload failed: {api_error(up)}")
+                        else:
+                            ss["video_uploaded"] = True
+                            # Swap the preview from the audio to the real
+                            # picture and drop the background note.
+                            st.rerun()
+                    except requests.RequestException as e:
+                        st.error(f"Video upload failed: {e}")
+                else:
+                    st.success("Original video uploaded — ready to render.")
+            if not ss.get("video_uploaded"):
+                if _from_video:
+                    st.caption("If the automatic transfer stalled, pick the video file again above.")
+                else:
+                    st.caption("Captions are burned into a picture — add the video to use.")
+
+        # Without the picture there is nothing to burn into, so the render
+        # stays locked instead of failing in FFmpeg (it needs a video stream).
+        _needs_video = _audio_only and not ss.get("video_uploaded")
+        render_clicked = st.button(
+            "Render MP4 with captions", type="primary", width="stretch",
+            disabled=_needs_video, icon=":material/movie:",
+        )
+        if render_clicked:
+            if _needs_video:
+                st.error("The video has not finished uploading yet — the render needs the picture.")
+                st.stop()
+            # The burn-in uses the ORIGINAL video when one was supplied, else
+            # the media the captions were made from.
+            _render_media_id = ss.get("video_media_id") or ss["media_id"]
+            # Render reuses the server-side copy (uploaded once at Generate
+            # time) — no second upload. If the engine restarted since, upload
+            # once more first.
+            if not ss.get("media_uploaded") and not ss.get("video_media_id"):
+                payload = media_bytes()
+                if payload is None:
+                    st.error("Upload failed: file bytes unavailable — re-select the file.")
+                    st.stop()
+                try:
+                    up = post_media(
+                        ss["media_id"], ss["file_meta"]["name"], payload,
+                        ss["file_meta"]["type"],
+                    )
+                    if up.status_code != 200:
+                        st.error(f"Upload failed: {api_error(up)}")
+                        st.stop()
+                    ss["media_uploaded"] = True
+                    drop_media_bytes()
+                except requests.RequestException as e:
+                    st.error(f"Could not upload for render: {e}")
+                    st.stop()
+            try:
+                _render_body = ({"media_id": _render_media_id, "srt": srt_content,
+                                  "width": res_w, "height": res_h} if res_w
+                                else {"media_id": _render_media_id, "srt": srt_content})
+                resp = requests.post(
+                    f"{API_URL}/render",
+                    data=style_payload(_render_body),
+                    timeout=180,
+                )
+            except requests.RequestException as e:
+                st.error(f"Could not start render: {e}")
+            else:
+                if resp.status_code == 404:
+                    ss["media_uploaded"] = False
+                    st.error("Engine lost the uploaded copy (restarted) — press Render again to re-upload once.")
+                elif resp.status_code != 200:
+                    st.error(f"Render failed to start: {api_error(resp)}")
+                else:
+                    ss["render_job_id"] = resp.json()["job_id"]
+                    ss["render_started"] = time.time()
+                    ss["render_bytes"] = None
+                    ss["render_name"] = None
+
+        if ss["render_job_id"]:
+            try:
+                status_resp = requests.get(f"{API_URL}/render/status/{ss['render_job_id']}", timeout=30)
+            except requests.RequestException:
+                status_resp = None
+
+            if status_resp is not None and status_resp.status_code == 200:
+                job = status_resp.json()
+                prog = st.progress(0, text="Starting…")
+                _elapsed = int(time.time() - ss.get("render_started", time.time()))
+                prog.progress(min(100, int(job["progress"])),
+                              text=f"{job['status'].title()} · {job['progress']:.0f}%"
+                                   + (f" · {job['encoder']}" if job.get("encoder") else "")
+                                   + (f" · {_elapsed // 60} min {_elapsed % 60:02d}s" if _elapsed >= 60 else ""))
+                st.caption("Rendering on a shared CPU — a long clip takes several minutes. "
+                           "Keep this tab open to download the result.")
+
+                if job["status"] == "error":
+                    st.error(f"Render failed: {job['error']}")
+                    ss["render_job_id"] = None
+                elif job["status"] == "done":
+                    ss["render_name"] = f"quran_captions_{ss['render_job_id']}.mp4"
+                    try:
+                        r = requests.get(f"{API_URL}/render/result/{ss['render_job_id']}", timeout=1200)
+                        if r.status_code == 200:
+                            ss["render_bytes"] = r.content
+                        else:
+                            st.error("Could not download the rendered video.")
+                    except requests.RequestException as e:
+                        st.error(f"Could not download the rendered video: {e}")
+                    ss["render_job_id"] = None
+                else:
+                    # Polling re-executes this whole script, and on the free
+                    # tier that rerun competes with FFmpeg for the same 0.1
+                    # CPU — a 1.5s poll starved the encoder and a 70s clip
+                    # took >12 min.
+                    time.sleep(6)
+                    st.rerun()
+
+        # The finished render stays available: a download click reruns the
+        # script, so the result must outlive the single poll that produced it.
+        if ss.get("render_bytes") and not ss["render_job_id"]:
+            st.success("Video rendered.")
+            st.video(ss["render_bytes"])
+            st.download_button(
+                "Download MP4", data=ss["render_bytes"],
+                file_name=ss.get("render_name") or "quran_captions.mp4",
+                mime="video/mp4", width="stretch",
+                icon=":material/download:",
+            )
+
+    # ---------------------------------------------------------------- Sync inspector
+    _words = (ss.get("align_result") or {}).get("words") or []
+    with st.expander("Sync inspector", icon=":material/graphic_eq:", key="exp_inspector"):
         st.caption(
             "Waveform, speech and captions on one timeline. "
             "Wheel = zoom, drag = pan, click = seek."
         )
-        _words = (ss.get("align_result") or {}).get("words") or []
         # Building the chart reads the whole audio, so it only runs on demand.
-        if st.button("📈 Build the sync chart", key="sync_build"):
+        if st.button("Build the sync chart", key="sync_build", icon=":material/analytics:"):
             ss["sync_live"] = True
 
     # The chart itself lives OUTSIDE the expander: clicking Build reruns the
@@ -1074,170 +1455,7 @@ if ss["align_result"] is not None and ss["segments"]:
                 unsafe_allow_javascript=True,
             )
 
-    # ---------------------------------------------------------------- Burn-in & download
-    st.markdown("#### Burn-in & download")
-    srt_content = srt_from_segments(ss["segments"], ss["lang"])
-    res_label = st.selectbox("Output resolution", list(RESOLUTIONS.keys()), index=0)
-    res_w, res_h = RESOLUTIONS[res_label]
-
-    # An audio upload has no picture to burn the captions into, so the
-    # matching video is asked for here (once, at render time). A video picked
-    # in step 1 arrives as its soundtrack first (frontend/auto_proxy.js) and
-    # is auto-filled here in the background — that upload is the picture the
-    # MP4 must use, never the proxy.
-    _meta = ss.get("file_meta") or {}
-    _name = (_meta.get("name") or "").lower()
-    _audio_only = (_meta.get("type") or "").startswith("audio/") or _name.endswith(
-        (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
-    )
-    _from_video = source_is_video()
-    if _audio_only:
-        if _from_video:
-            if not ss.get("video_uploaded"):
-                st.info(
-                    "Sending your video to the caption engine in the background. "
-                    "You can keep editing — rendering unlocks as soon as it lands."
-                )
-            else:
-                st.caption(f"Video: {source_video_name()}")
-        else:
-            st.caption("The video the captions are burned into.")
-        _vfile = st.file_uploader(
-            "Video for the burned-in MP4",
-            type=["mp4", "webm", "mov", "avi", "mkv"],
-            label_visibility="collapsed",
-            # A new clip gets a fresh widget, so the previous clip's video
-            # can never be rendered under the new captions.
-            key=f"video_uploader_{ss['media_id']}",
-        )
-        if _vfile is not None:
-            if ss.get("video_media_id") is None or ss.get("video_meta", {}).get("file_id") != getattr(_vfile, "file_id", None):
-                ss["video_media_id"] = uuid.uuid4().hex[:10]
-                ss["video_meta"] = {"name": _vfile.name, "file_id": getattr(_vfile, "file_id", None)}
-                ss["preview_video_uri"] = None
-                ss["preview_video_tried"] = False
-            if not ss.get("video_uploaded"):
-                try:
-                    with st.spinner("Uploading the original video…"):
-                        up = post_media(
-                            ss["video_media_id"], _vfile.name, _vfile, _vfile.type
-                        )
-                    if up.status_code != 200:
-                        st.error(f"Video upload failed: {api_error(up)}")
-                    else:
-                        ss["video_uploaded"] = True
-                        # Swap the preview from the audio to the real picture
-                        # and drop the "uploading in the background" note.
-                        st.rerun()
-                except requests.RequestException as e:
-                    st.error(f"Video upload failed: {e}")
-            else:
-                st.success("Original video uploaded — ready to render.")
-        if not ss.get("video_uploaded"):
-            if _from_video:
-                st.caption("If the automatic transfer stalled, pick the video file again above.")
-            else:
-                st.caption("Captions are burned into a picture — add the video to use.")
-
-    # Without the picture there is nothing to burn into, so the render stays
-    # locked instead of failing in FFmpeg (it needs a video stream).
-    _needs_video = _audio_only and not ss.get("video_uploaded")
-    render_clicked = st.button(
-        "Render MP4 with captions", type="primary", use_container_width=True,
-        disabled=_needs_video,
-    )
-    if render_clicked:
-        if _needs_video:
-            st.error("The video has not finished uploading yet — the render needs the picture.")
-            st.stop()
-        # The burn-in uses the ORIGINAL video when one was supplied, else the
-        # media the captions were made from.
-        _render_media_id = ss.get("video_media_id") or ss["media_id"]
-        # Render reuses the server-side copy (uploaded once at Generate
-        # time) — no second upload. If the engine restarted since, upload
-        # once more first.
-        if not ss.get("media_uploaded") and not ss.get("video_media_id"):
-            payload = media_bytes()
-            if payload is None:
-                st.error("Upload failed: file bytes unavailable — re-select the file.")
-                st.stop()
-            try:
-                up = post_media(
-                    ss["media_id"], ss["file_meta"]["name"], payload,
-                    ss["file_meta"]["type"],
-                )
-                if up.status_code != 200:
-                    st.error(f"Upload failed: {api_error(up)}")
-                    st.stop()
-                ss["media_uploaded"] = True
-                drop_media_bytes()
-            except requests.RequestException as e:
-                st.error(f"Could not upload for render: {e}")
-                st.stop()
-        try:
-            _render_body = ({"media_id": _render_media_id, "srt": srt_content,
-                              "width": res_w, "height": res_h} if res_w
-                            else {"media_id": _render_media_id, "srt": srt_content})
-            resp = requests.post(
-                f"{API_URL}/render",
-                data=style_payload(_render_body),
-                timeout=180,
-            )
-        except requests.RequestException as e:
-            st.error(f"Could not start render: {e}")
-        else:
-            if resp.status_code == 404:
-                ss["media_uploaded"] = False
-                st.error("Engine lost the uploaded copy (restarted) — press Render again to re-upload once.")
-            elif resp.status_code != 200:
-                st.error(f"Render failed to start: {api_error(resp)}")
-            else:
-                ss["render_job_id"] = resp.json()["job_id"]
-                ss["render_started"] = time.time()
-
-    if ss["render_job_id"]:
-        try:
-            status_resp = requests.get(f"{API_URL}/render/status/{ss['render_job_id']}", timeout=30)
-        except requests.RequestException:
-            status_resp = None
-
-        if status_resp is not None and status_resp.status_code == 200:
-            job = status_resp.json()
-            prog = st.progress(0, text="Starting…")
-            _elapsed = int(time.time() - ss.get("render_started", time.time()))
-            prog.progress(min(100, int(job["progress"])),
-                          text=f"{job['status'].title()} · {job['progress']:.0f}%"
-                               + (f" · {job['encoder']}" if job.get("encoder") else "")
-                               + (f" · {_elapsed // 60} min {_elapsed % 60:02d}s" if _elapsed >= 60 else ""))
-            st.caption("Rendering on a shared CPU — a long clip takes several minutes. "
-                       "Keep this tab open to download the result.")
-
-            if job["status"] == "error":
-                st.error(f"Render failed: {job['error']}")
-                ss["render_job_id"] = None
-            elif job["status"] == "done":
-                try:
-                    r = requests.get(f"{API_URL}/render/result/{ss['render_job_id']}", timeout=1200)
-                    if r.status_code == 200:
-                        st.success("Video rendered.")
-                        st.video(r.content)
-                        st.download_button(
-                            "Download MP4", data=r.content,
-                            file_name=f"quran_captions_{ss['render_job_id']}.mp4",
-                            mime="video/mp4", use_container_width=True,
-                        )
-                    else:
-                        st.error("Could not download the rendered video.")
-                except requests.RequestException as e:
-                    st.error(f"Could not download the rendered video: {e}")
-                ss["render_job_id"] = None
-            else:
-                # Polling re-executes this whole script, and on the free tier
-                # that rerun competes with FFmpeg for the same 0.1 CPU — a
-                # 1.5s poll starved the encoder and a 70s clip took >12 min.
-                time.sleep(6)
-                st.rerun()
-
+    # ---------------------------------------------------------------- Timing editor
     def on_segment_edit():
         edits = st.session_state.get("seg_editor", {})
         edited = edits.get("edited_rows", {})
@@ -1259,51 +1477,48 @@ if ss["align_result"] is not None and ss["segments"]:
         # no st.rerun() here: Streamlit reruns automatically after on_change
         # (an explicit rerun causes a double-rerun that can drop edits).
 
-    st.markdown("#### Ayah timing & text — edit to fix any misalignment")
-    ayahs = sorted({s["ayah"] for s in ss["segments"]})
-    jump = st.selectbox(
-        "Jump to ayah",
-        options=["All"] + [str(a) for a in ayahs],
-        help="Filter the table to one ayah. Switch back to All to edit.",
-    )
-    full_df = pd.DataFrame(ss["segments"])[["ayah", "start", "end", "text_ar", "text_en"]]
-    if jump == "All":
-        df, editable, note = full_df, True, None
-    else:
-        df = full_df[full_df["ayah"] == int(jump)]
-        editable, note = False, "Viewing one ayah — switch to All to edit."
-    if note:
-        st.caption(note)
-    st.data_editor(
-        df,
-        key="seg_editor",
-        num_rows="fixed",
-        hide_index=True,
-        disabled=not editable,
-        on_change=on_segment_edit if editable else None,
-        column_config={
-            "ayah": st.column_config.NumberColumn("Ayah", min_value=1, step=1),
-            "start": st.column_config.NumberColumn("Start (s)", min_value=0.0, format="%.2f"),
-            "end": st.column_config.NumberColumn("End (s)", min_value=0.0, format="%.2f"),
-            "text_ar": st.column_config.TextColumn("Arabic text", width="large"),
-            "text_en": st.column_config.TextColumn("English text", width="large"),
-        },
-    )
+    with st.expander("Fine-tune timings & text", icon=":material/table_chart:", key="exp_timing"):
+        st.caption("Edit any cue to fix a misalignment; changes apply to the player and both exports.")
+        ayahs = sorted({s["ayah"] for s in ss["segments"]})
+        jump = st.selectbox(
+            "Jump to ayah",
+            options=["All"] + [str(a) for a in ayahs],
+            help="Filter the table to one ayah. Switch back to All to edit.",
+        )
+        full_df = pd.DataFrame(ss["segments"])[["ayah", "start", "end", "text_ar", "text_en"]]
+        if jump == "All":
+            df, editable, note = full_df, True, None
+        else:
+            df = full_df[full_df["ayah"] == int(jump)]
+            editable, note = False, "Viewing one ayah — switch back to All to edit."
+        if note:
+            st.caption(note)
+        st.data_editor(
+            df,
+            key="seg_editor",
+            num_rows="fixed",
+            hide_index=True,
+            width="stretch",
+            disabled=not editable,
+            on_change=on_segment_edit if editable else None,
+            column_config={
+                "ayah": st.column_config.NumberColumn("Ayah", min_value=1, step=1, width="small"),
+                "start": st.column_config.NumberColumn("Start (s)", min_value=0.0, format="%.2f", width="small"),
+                "end": st.column_config.NumberColumn("End (s)", min_value=0.0, format="%.2f", width="small"),
+                "text_ar": st.column_config.TextColumn("Arabic text", width="medium"),
+                "text_en": st.column_config.TextColumn("English text", width="medium"),
+            },
+        )
 
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "Download SRT",
-            data=srt_content.encode("utf-8"),
-            file_name=f"captions_{ss['lang']}.srt",
-            mime="application/x-subrip",
-            use_container_width=True,
-        )
-    with dl2:
-        st.download_button(
-            "Download VTT",
-            data=vtt_from_srt(srt_content).encode("utf-8"),
-            file_name=f"captions_{ss['lang']}.vtt",
-            mime="text/vtt",
-            use_container_width=True,
-        )
+    # ---------------------------------------------------------------- Start over
+    st.write("")
+    with st.container(horizontal=True, horizontal_alignment="center"):
+        if st.button(
+            "Start over with a different clip",
+            icon=":material/restart_alt:",
+            type="tertiary",
+            key="start_over",
+        ):
+            prune_static([ss.get("media_id"), ss.get("video_media_id")])
+            ss.clear()
+            st.rerun()
