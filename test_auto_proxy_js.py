@@ -1,10 +1,10 @@
-"""The automatic fast upload must hand Streamlit an audio proxy, and later
-the burn-in uploader must receive the original video.
+"""The browser must hand Streamlit a tiny carrier and stream the real clip
+straight to the engine.
 
 This is a runtime bug class a string scan cannot catch. It lifts the shipped
-`frontend/auto_proxy.js`, runs it in Node against a stubbed DOM, feeds it a
-change event the way the browser would, and checks what actually reached the
-two uploaders.
+frontend/auto_proxy.js, runs it in Node against a stubbed DOM/fetch, feeds it
+a change event the way the browser would, and checks what reached the
+uploader versus what went to /engine/media/....
 """
 import json
 import os
@@ -16,13 +16,19 @@ import pytest
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# The stub models: the step-1 uploader (st-key-file_uploader container),
+# the fetch calls the script makes (ping + slice uploads), and the file
+# objects the DataTransfer path carries.
 STUB = textwrap.dedent("""
     var __inputs = [];
     var __changeHandler = null;
-    var __interval = null;
     var __created = [];
     var __notes = [];
-    var __videoBox = null;
+    var __fetchCalls = [];
+    var __fetchBehavior = function (url, opts) {
+      return { ok: true, status: 200, json: { ok: true } };
+    };
+    var __seq = 0;
 
     function __el(tag) {
       return {
@@ -47,8 +53,29 @@ STUB = textwrap.dedent("""
       return e;
     }
 
+    function __makeFile(name, type, size, parts) {
+      var body = parts || new Uint8Array(size);
+      return {
+        name: name, type: type || 'application/octet-stream', size: size,
+        slice: function (a, b) {
+          return { name: name, type: this.type, size: b - a, __range: [a, b] };
+        },
+        text: function () {
+          return Promise.resolve(
+            typeof body === 'string' ? body : Buffer.from(body).toString('utf8'));
+        },
+        __parts: body
+      };
+    }
+
     var __host = __el('div');
     __host.parentNode = __el('div');
+    // The uploader container holds exactly the one step-1 input.
+    var __uploaderHost = __el('div');
+    __uploaderHost.querySelector = function (sel) {
+      if (String(sel).indexOf('input') >= 0) { return __inputs[0] || null; }
+      return null;
+    };
 
     var document = {
       addEventListener: function (t, f) { if (t === 'change') { __changeHandler = f; } },
@@ -77,14 +104,11 @@ STUB = textwrap.dedent("""
       },
       querySelector: function (sel) {
         var s = String(sel);
+        if (s.indexOf('st-key-file_uploader') >= 0) { return __uploaderHost; }
         if (s.indexOf('stFileUploader') >= 0) { return __host; }
-        if (s.indexOf('st-key-video_uploader') >= 0) { return __videoBox; }
         return null;
       },
-      querySelectorAll: function (sel) {
-        if (String(sel).indexOf('stFileUploaderDropzoneInput') >= 0) { return __inputs; }
-        return [];
-      },
+      querySelectorAll: function () { return []; },
       body: __el('body')
     };
 
@@ -93,14 +117,25 @@ STUB = textwrap.dedent("""
       createObjectURL: function () { return 'blob:fake'; },
       revokeObjectURL: function () {}
     };
-    var __timers = require('timers');
-    var __intervals = [];
-    function setInterval(f, ms) { __intervals.push(f); return __intervals.length; }
-    function setTimeout(f, ms) { return __timers.setTimeout(f, Math.min(ms || 0, 5)); }
+    var TextEncoder = require('util').TextEncoder;
     function File(parts, name, opts) {
-      this.name = name; this.type = (opts || {}).type; this.size = 2000000;
-      this.__parts = parts;
+      var body = (parts && parts[0]) || '';
+      this.name = name;
+      this.type = (opts || {}).type || 'application/octet-stream';
+      if (body && body.byteLength != null) { this.size = body.byteLength; }
+      else if (body && body.size != null) { this.size = body.size; }
+      else { this.size = Buffer.byteLength(String(body)); }
+      this.__body = body;
     }
+    File.prototype.slice = function (a, b) {
+      return { name: this.name, type: this.type, size: Math.max(0, b - a), __range: [a, b] };
+    };
+    File.prototype.text = function () {
+      var b = this.__body;
+      if (b && typeof b === 'object' && b.__range) { return Promise.resolve(''); }
+      if (b instanceof Uint8Array) { return Promise.resolve(Buffer.from(b).toString('utf8')); }
+      return Promise.resolve(String(b));
+    };
     function DataTransfer() {
       var self = this;
       this.__list = [];
@@ -108,160 +143,230 @@ STUB = textwrap.dedent("""
       Object.defineProperty(this, 'files', { get: function () { return self.__list; } });
     }
     function Event(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); }
+    var setTimeout = require('timers').setTimeout;
+    var setInterval = require('timers').setInterval;
+    // Poll-until pattern for the async upload chain (fetch -> extraction ->
+    // carrier handoff); a fixed sleep races it on slow machines.
+    function waitFor(pred, cb, tries) {
+      tries = tries === undefined ? 200 : tries;
+      if (pred() || tries <= 0) { cb(); return; }
+      setTimeout(function () { waitFor(pred, cb, tries - 1); }, 15);
+    }
+    var fetch = function (url, opts) {
+      __fetchCalls.push({ url: String(url), opts: opts || {} });
+      var r = __fetchBehavior(String(url), opts || {});
+      if (r instanceof Error) { return Promise.reject(r); }
+      return Promise.resolve({ ok: !!r.ok, status: r.status || 200,
+                               json: function () {
+                                 if (typeof r.json === 'function') { return r.json(); }
+                                 return Promise.resolve(r.json || {});
+                               } });
+    };
+    var crypto = { randomUUID: function () {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+        var r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+      });
+    } };
 """)
 
-DRIVE = textwrap.dedent("""
+VIDEO_DRIVE = textwrap.dedent("""
     function assert(c, msg) {
       if (!c) { console.error('FAIL: ' + msg); process.exit(1); }
     }
 
     var MAIN = __input();
-    var FAKE = { name: 'recitation.mp4', type: 'video/mp4', size: 40000000 };
-    MAIN.files = [FAKE];
+    MAIN.files = [__makeFile('recitation.mp4', 'video/mp4', 40000000)];
 
-    var proxied = null;
+    var encodeCalls = 0;
     window.QcapProxy = {
       buildAudioProxy: function (f, o) {
-        proxied = { file: f, opts: o };
+        encodeCalls++;
+        assert(o && o.format === 'ogg_opus', 'opus format');
         return Promise.resolve({
-          file: new File([], 'recitation_audio.ogg', { type: 'audio/ogg' }),
-          bytes: 2100000, originalBytes: 40000000, ratio: 0.05,
+          file: new File([new Uint8Array(2000000)], 'recitation_audio.ogg', { type: 'audio/ogg' }),
+          bytes: 2000000, originalBytes: 40000000, ratio: 0.05,
           format: 'ogg_opus', durationSec: 480
         });
       }
     };
-
     __changeHandler({ target: MAIN, stopPropagation: function () {},
                       stopImmediatePropagation: function () {} });
 
-    setTimeout(function () {
-      assert(proxied, 'the video must go through the audio encoder');
-      assert(proxied.opts && proxied.opts.format === 'ogg_opus', 'opus format');
-      assert(window.__qcapSource === FAKE, 'the original stays in memory');
-      assert(MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'recitation.mp4.audio.ogg',
-             'the uploader must receive the soundtrack, got ' +
-             (MAIN.files && MAIN.files[0] && MAIN.files[0].name));
-      assert(MAIN.lastEvent && MAIN.lastEvent.type === 'change',
-             'Streamlit must be told the file changed');
-
-      // ---- the burn-in step appears: the video fills it automatically ----
-      var BURN = __input();
-      __intervals.forEach(function (f) { f(); });
-      assert(window.__qcapSourceUsed, 'auto-fill must run once');
-      assert(BURN.files && BURN.files[0] === FAKE, 'the burn-in uploader gets the video');
-      assert(BURN.lastEvent && BURN.lastEvent.type === 'change', 'burn-in change fired');
-      assert(BURN.getAttribute('data-qcap-burnin'), 'burn-in input is marked');
-
-      // ---- a replay of the same event must not re-enter the encoder ----
-      var before = proxied;
-      __changeHandler({ target: MAIN, stopPropagation: function () {},
-                        stopImmediatePropagation: function () {} });
-      assert(proxied === before, 'injected change must not be re-proxied');
-
-      console.log(JSON.stringify({
-        ok: true, source: window.__qcapSource.name,
-        proxy: MAIN.files[0].name, burn: BURN.files[0].name
-      }));
-    }, 50);
+    waitFor(function () {
+      return MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'caption_carrier.qcap';
+    }, function () {
+      var pings = __fetchCalls.filter(function (c) { return /\\/engine\\/media\\/ping/.test(c.url); });
+      assert(pings.length === 1, 'exactly one reachability probe');
+      var uploads = __fetchCalls.filter(function (c) { return /\\/engine\\/media\\/.+\\/upload/.test(c.url); });
+      assert(uploads.length >= 2, 'soundtrack + raw slices must reach the engine, got ' + uploads.length);
+      var carrier = MAIN.files && MAIN.files[0];
+      assert(carrier && carrier.name === 'caption_carrier.qcap',
+             'the uploader must receive the carrier, got ' + (carrier && carrier.name));
+      carrier.text().then(function (txt) {
+        var doc = JSON.parse(txt);
+        assert(doc.name === 'recitation.mp4', 'carrier keeps the picked file name');
+        assert(doc.is_video === true, 'carrier marks the pick as a video');
+        assert(doc.size === 40000000, 'carrier keeps the size');
+        assert(doc.media_id && doc.video_media_id, 'carrier carries both engine ids');
+        assert(doc.media_id !== doc.video_media_id, 'soundtrack and raw copies are separate ids');
+        // the soundtrack id (align) must be the one whose slices finished FIRST
+        var aid = doc.media_id;
+        var aidCalls = uploads.filter(function (c) { return c.url.indexOf('/media/' + aid + '/') >= 0; });
+        var rawCalls = uploads.filter(function (c) { return c.url.indexOf('/media/' + doc.video_media_id + '/') >= 0; });
+        assert(aidCalls.length >= 1, 'the soundtrack was streamed to the engine');
+        assert(rawCalls.length >= 1, 'the raw video was streamed to the engine');
+        assert(__fetchCalls.indexOf(aidCalls[aidCalls.length - 1]) < __fetchCalls.indexOf(rawCalls[0]),
+               'the soundtrack stream finishes before the raw one starts');
+        assert(window.__qcapSource && window.__qcapSource.name === 'recitation.mp4',
+               'the picked file stays in memory for the Blob preview');
+        console.log(JSON.stringify({ ok: true, align: doc.media_id, raw: doc.video_media_id,
+                                     slices: uploads.length }));
+      }).catch(function (e) { console.error('FAIL: ' + e); process.exit(1); });
+    });
 """)
 
-FALLBACK_DRIVE = textwrap.dedent("""
+EXTRACTION_FAILURE_DRIVE = textwrap.dedent("""
+    function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
     var MAIN = __input();
-    var FAKE = { name: 'broken.mp4', type: 'video/mp4', size: 40000000 };
-    MAIN.files = [FAKE];
+    MAIN.files = [__makeFile('broken.mp4', 'video/mp4', 40000000)];
     window.QcapProxy = {
       buildAudioProxy: function () { return Promise.reject(new Error('no WebCodecs')); }
     };
     __changeHandler({ target: MAIN, stopPropagation: function () {},
                       stopImmediatePropagation: function () {} });
-    setTimeout(function () {
-      if (!(MAIN.lastEvent && MAIN.lastEvent.type === 'change')) {
-        console.error('FAIL: fallback never reached the uploader'); process.exit(1);
-      }
-      if (MAIN.files[0] !== FAKE) {
-        console.error('FAIL: fallback must upload the original'); process.exit(1);
-      }
-      console.log(JSON.stringify({ ok: true, fellBackTo: MAIN.files[0].name }));
-    }, 50);
+    waitFor(function () {
+      return MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'caption_carrier.qcap';
+    }, function () {
+      var carrier = MAIN.files && MAIN.files[0];
+      assert(carrier && carrier.name === 'caption_carrier.qcap', 'carrier handed over');
+      carrier.text().then(function (txt) {
+        var doc = JSON.parse(txt);
+        assert(doc.media_id === doc.video_media_id,
+               'without extraction the captions align on the raw upload');
+        var uploads = __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); });
+        assert(uploads.length >= 1, 'raw bytes were streamed');
+        console.log(JSON.stringify({ ok: true, align: doc.media_id }));
+      });
+    });
 """)
 
-# In the result view the step-1 uploader is gone, so the burn-in uploader is
-# the only file input on the page — the background fill must still find it.
-ONLY_BURNIN_FILL_DRIVE = textwrap.dedent("""
-    function assert(c, msg) {
-      if (!c) { console.error('FAIL: ' + msg); process.exit(1); }
-    }
-
+ENGINE_DOWN_DRIVE = textwrap.dedent("""
+    function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
     var MAIN = __input();
-    var FAKE = { name: 'recitation.mp4', type: 'video/mp4', size: 40000000 };
-    MAIN.files = [FAKE];
-    window.QcapProxy = {
-      buildAudioProxy: function () {
-        return Promise.resolve({
-          file: new File([], 'x.ogg', { type: 'audio/ogg' }), bytes: 2000000
-        });
-      }
+    MAIN.files = [__makeFile('recitation.mp4', 'video/mp4', 40000000)];
+    __fetchBehavior = function (url) {
+      if (/\\/engine\\/media\\/ping/.test(url)) { return new Error('connection refused'); }
+      return { ok: true, status: 200 };
     };
     __changeHandler({ target: MAIN, stopPropagation: function () {},
                       stopImmediatePropagation: function () {} });
-    setTimeout(function () {
-      // The result view mounted: only the burn-in uploader exists now.
-      __inputs.length = 0;
-      var BURN = __input();
-      __videoBox = __el('div');
-      __videoBox.querySelector = function () { return BURN; };
-      __intervals.forEach(function (f) { f(); });
-      assert(window.__qcapSourceUsed, 'auto-fill must run once');
-      assert(BURN.files && BURN.files[0] === FAKE,
-             'the burn-in uploader must get the video');
-      assert(BURN.getAttribute('data-qcap-burnin'), 'burn-in input is marked');
-      console.log(JSON.stringify({ ok: true, burn: BURN.files[0].name }));
-    }, 50);
+    waitFor(function () { return __fetchCalls.length >= 1 && MAIN.files[0]; }, function () {
+      var handed = MAIN.files && MAIN.files[0];
+      assert(handed && handed.name === 'recitation.mp4',
+             'with no engine the ORIGINAL file goes through Streamlit');
+      var uploads = __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); });
+      assert(uploads.length === 0, 'no bytes may stream when the engine is down');
+      console.log(JSON.stringify({ ok: true, handed: handed.name }));
+    });
 """)
 
-# A manual pick in the burn-in uploader is already the picture: proxying it
-# would replace the video with an .ogg that uploader rejects.
-MANUAL_BURNIN_DRIVE = textwrap.dedent("""
-    function assert(c, msg) {
-      if (!c) { console.error('FAIL: ' + msg); process.exit(1); }
-    }
-
-    var BURN = __input();
-    var FAKE = { name: 'recitation.mp4', type: 'video/mp4', size: 40000000 };
-    BURN.files = [FAKE];
-    __videoBox = __el('div');
-    __videoBox.contains = function (el) { return el === BURN; };
-    var proxied = false, stopped = false;
-    window.QcapProxy = {
-      buildAudioProxy: function () {
-        proxied = true;
-        return Promise.resolve({ file: BURN.files[0] });
-      }
-    };
-    __changeHandler({ target: BURN,
-                      stopPropagation: function () { stopped = true; },
-                      stopImmediatePropagation: function () { stopped = true; } });
-    setTimeout(function () {
-      assert(!proxied, 'a manual burn-in pick must not be re-encoded');
-      assert(!stopped, 'the event must reach Streamlit untouched');
-      assert(!BURN.lastEvent, 'nothing may be re-injected into the burn-in');
-      console.log(JSON.stringify({ ok: true }));
-    }, 50);
-""")
-
-PASSTHROUGH_DRIVE = textwrap.dedent("""
+ENGINE_HTML_DRIVE = textwrap.dedent("""
+    // A host without the proxy answers /engine/media/ping with the app's
+    // HTML page (HTTP 200). It must NOT pass the probe — that would send
+    // uploads to a route that does not exist instead of falling back.
+    function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
     var MAIN = __input();
-    var AUDIO = { name: 'clip.mp3', type: 'audio/mpeg', size: 3000000 };
-    MAIN.files = [AUDIO];
-    var called = false;
-    window.QcapProxy = { buildAudioProxy: function () { called = true; } };
+    MAIN.files = [__makeFile('recitation.mp4', 'video/mp4', 40000000)];
+    __fetchBehavior = function (url) {
+      if (/\\/engine\\/media\\/ping/.test(url)) {
+        return { ok: true, status: 200,
+                 json: function () { return Promise.reject(new Error('Unexpected token <')); } };
+      }
+      return { ok: true, status: 200 };
+    };
     __changeHandler({ target: MAIN, stopPropagation: function () {},
                       stopImmediatePropagation: function () {} });
-    setTimeout(function () {
-      if (called) { console.error('FAIL: audio must not be proxied'); process.exit(1); }
-      if (MAIN.lastEvent) { console.error('FAIL: audio change was swallowed'); process.exit(1); }
-      console.log(JSON.stringify({ ok: true }));
-    }, 50);
+    waitFor(function () { return __fetchCalls.length >= 1 && MAIN.files[0]; }, function () {
+      var handed = MAIN.files && MAIN.files[0];
+      assert(handed && handed.name === 'recitation.mp4',
+             'an HTML 200 from a proxyless host must fall back to Streamlit');
+      var uploads = __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); });
+      assert(uploads.length === 0, 'no bytes may stream without the engine route');
+      console.log(JSON.stringify({ ok: true, handed: handed.name }));
+    });
+""")
+
+AUDIO_DRIVE = textwrap.dedent("""
+    function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
+    var MAIN = __input();
+    MAIN.files = [__makeFile('lecture.mp3', 'audio/mpeg', 3000000)];
+    var proxied = false;
+    window.QcapProxy = { buildAudioProxy: function () { proxied = true;
+      return Promise.resolve({ file: MAIN.files[0], bytes: 3000000 }); } };
+    __changeHandler({ target: MAIN, stopPropagation: function () {},
+                      stopImmediatePropagation: function () {} });
+    waitFor(function () {
+      return MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'caption_carrier.qcap';
+    }, function () {
+      assert(!proxied, 'small audio skips the soundtrack detour');
+      var carrier = MAIN.files && MAIN.files[0];
+      assert(carrier && carrier.name === 'caption_carrier.qcap', 'carrier handed over');
+      carrier.text().then(function (txt) {
+        var doc = JSON.parse(txt);
+        assert(doc.is_video === false, 'audio is not a video');
+        assert(doc.video_media_id === null, 'audio has no picture for the burn-in');
+        assert(doc.media_id, 'the raw stream id is the align id');
+        var uploads = __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); });
+        assert(uploads.length === 1, 'one slice for 3MB, got ' + uploads.length);
+        console.log(JSON.stringify({ ok: true, align: doc.media_id }));
+      });
+    });
+""")
+
+TOO_LARGE_DRIVE = textwrap.dedent("""
+    var MAIN = __input();
+    MAIN.files = [__makeFile('huge.mp4', 'video/mp4', 900 * 1024 * 1024)];
+    window.__qcapMaxBytes = 100 * 1024 * 1024;
+    __changeHandler({ target: MAIN, stopPropagation: function () {},
+                      stopImmediatePropagation: function () {} });
+    waitFor(function () { return MAIN.files && MAIN.files[0]; }, function () {
+      var carrier = MAIN.files && MAIN.files[0];
+      var uploads = __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); });
+      carrier.text().then(function (txt) {
+        var doc = JSON.parse(txt);
+        if (!doc.too_large) { console.error('FAIL: oversized pick must be flagged'); process.exit(1); }
+        if (uploads.length !== 0) { console.error('FAIL: nothing may stream past the cap'); process.exit(1); }
+        console.log(JSON.stringify({ ok: true }));
+      });
+    });
+""")
+
+RESTART_ON_409_DRIVE = textwrap.dedent("""
+    function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
+    var MAIN = __input();
+    MAIN.files = [__makeFile('clip.mp3', 'audio/mpeg', 3000000)];
+    var seen409 = 0;
+    __fetchBehavior = function (url, opts) {
+      if (/\\/engine\\/media\\/ping/.test(url)) { return { ok: true, status: 200, json: { ok: true } }; }
+      if (/\\/upload/.test(url) && url.indexOf('offset=0') >= 0 && seen409 < 2) {
+        seen409++;
+        return { ok: false, status: 409 };
+      }
+      return { ok: true, status: 200 };
+    };
+    __changeHandler({ target: MAIN, stopPropagation: function () {},
+                      stopImmediatePropagation: function () {} });
+    waitFor(function () {
+      return seen409 >= 2 && __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); }).length >= 3;
+    }, function () {
+      assert(seen409 >= 2, 'the two 409s were answered');
+      var offsets = __fetchCalls
+        .filter(function (c) { return /\\/upload/.test(c.url); })
+        .map(function (c) { return (/offset=(\\d+)/.exec(c.url) || [])[1]; });
+      assert(offsets[offsets.length - 1] === '0', 'after 409s the stream restarts at 0');
+      console.log(JSON.stringify({ ok: true, calls: offsets.length }));
+    });
 """)
 
 
@@ -284,54 +389,35 @@ node_only = pytest.mark.skipif(shutil.which("node") is None, reason="node is not
 
 
 @node_only
-def test_video_is_proxied_and_the_burnin_gets_the_original(tmp_path):
-    r = _run(tmp_path, "auto_proxy.js", DRIVE)
-    assert r == {"ok": True, "source": "recitation.mp4",
-                 "proxy": "recitation.mp4.audio.ogg", "burn": "recitation.mp4"}
+def test_video_streams_to_engine_and_carrier_goes_to_streamlit(tmp_path):
+    assert _run(tmp_path, "video.js", VIDEO_DRIVE)["ok"]
 
 
 @node_only
-def test_the_shipped_proxy_name_is_readable_by_the_app(tmp_path):
-    """The JS names the proxy; frontend/media_store.py must recognize it.
-
-    If these drift apart the app treats a picked video as an audio upload
-    and can render (or refuse) the wrong thing."""
-    from frontend import media_store
-
-    name = _run(tmp_path, "auto_proxy_name.js", DRIVE)["proxy"]
-    assert media_store.is_audio_proxy(name)
-    assert media_store.proxy_source_name(name) == "recitation.mp4"
-
-
-def test_only_video_soundtracks_count_as_proxies():
-    from frontend import media_store
-
-    for name in ("recitation.mp4.audio.ogg", "clip.MOV.audio.ogg"):
-        assert media_store.is_audio_proxy(name), name
-    for name in ("clip.mp3", "clip.ogg", "foo_audio.ogg", "recitation.mp4",
-                 "notes.audio.ogg"):
-        assert not media_store.is_audio_proxy(name), name
+def test_extraction_failure_aligns_on_the_raw_upload(tmp_path):
+    assert _run(tmp_path, "extractfail.js", EXTRACTION_FAILURE_DRIVE)["ok"]
 
 
 @node_only
-def test_extraction_failure_falls_back_to_the_original(tmp_path):
-    r = _run(tmp_path, "auto_proxy_fallback.js", FALLBACK_DRIVE)
-    assert r["fellBackTo"] == "broken.mp4"
+def test_without_an_engine_the_original_file_is_handed_over(tmp_path):
+    assert _run(tmp_path, "engine_down.js", ENGINE_DOWN_DRIVE)["ok"]
 
 
 @node_only
-def test_audio_files_are_never_touched(tmp_path):
-    assert _run(tmp_path, "auto_proxy_audio.js", PASSTHROUGH_DRIVE)["ok"]
+def test_a_proxyless_host_degrades_to_streamlit(tmp_path):
+    assert _run(tmp_path, "engine_html.js", ENGINE_HTML_DRIVE)["ok"]
 
 
 @node_only
-def test_burnin_is_filled_when_it_is_the_only_uploader(tmp_path):
-    """After aligning, step 1 is gone — the background upload must still run."""
-    r = _run(tmp_path, "auto_proxy_only_burnin.js", ONLY_BURNIN_FILL_DRIVE)
-    assert r == {"ok": True, "burn": "recitation.mp4"}
+def test_small_audio_streams_raw_without_extraction(tmp_path):
+    assert _run(tmp_path, "audio.js", AUDIO_DRIVE)["ok"]
 
 
 @node_only
-def test_manual_burnin_pick_reaches_streamlit_untouched(tmp_path):
-    assert _run(tmp_path, "auto_proxy_manual_burnin.js",
-                MANUAL_BURNIN_DRIVE)["ok"]
+def test_oversized_pick_streams_nothing(tmp_path):
+    assert _run(tmp_path, "toobig.js", TOO_LARGE_DRIVE)["ok"]
+
+
+@node_only
+def test_offset_mismatch_restarts_the_stream(tmp_path):
+    assert _run(tmp_path, "restart.js", RESTART_ON_409_DRIVE)["ok"]

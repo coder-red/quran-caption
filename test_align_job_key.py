@@ -88,8 +88,8 @@ def test_a_purged_key_starts_a_new_job(jobs):
 
 def test_app_resumes_the_job_through_session_state():
     """Source guard: the frontend must keep the key + job id across reruns
-    and start the engine job with that key (the prefetch video landing in
-    the middle of an align is a rerun)."""
+    and start the engine job with that key (a rerun during the align
+    resumes the job instead of orphaning it)."""
     root = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(root, "frontend", "app.py"), encoding="utf-8-sig") as f:
         src = f.read()
@@ -97,7 +97,8 @@ def test_app_resumes_the_job_through_session_state():
     assert 'ss.setdefault("align_job_id", None)' in src
     assert '"key": ss["align_key"]' in src
     assert "def poll_align_job(" in src
-    # The hidden step-1 uploader is the prefetch; it must stay hidden and
-    # share the widget key of the render-step uploader.
-    assert 'key=f"video_prefetch_{ss[\'media_id\']}"' in src
-    assert 'key=f"video_uploader_{ss[\'media_id\']}"' in src
+    # The burn-in video streams straight to the engine in the browser
+    # (deploy/render/proxy.py); nothing in the widget tree can orphan it —
+    # the render button is unlocked by polling the engine's status.
+    assert "_video_upload_watch()" in src
+    assert "video_prefetch" not in src

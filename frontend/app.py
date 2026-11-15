@@ -24,8 +24,15 @@ if DEPLOYED:
     API_URL = "http://127.0.0.1:8000"
     PUBLIC_URL = ""
 
-# Fast upload: the browser extracts a video's audio and uploads only that
-# (see frontend/opus_proxy.js and frontend/auto_proxy.js).
+_MAX_UPLOAD_BYTES = int(os.environ.get("QCAP_MAX_MB", "400")) * 1024 * 1024
+
+# Direct-to-engine upload: the browser slices the picked clip and streams it
+# to the caption engine over same-origin /engine/media/... routes (a small
+# reverse proxy forwards only those three routes). Streamlit never holds the
+# bytes — it only gets a tiny .qcap carrier with the ids (see
+# frontend/auto_proxy.js and deploy/render/proxy.py). When there is no engine
+# route on this origin (plain local dev), the JS falls back to uploading the
+# file through Streamlit exactly as before.
 def _read_asset(name: str) -> str:
     try:
         with open(os.path.join(_HERE, name), encoding="utf-8") as f:
@@ -34,7 +41,10 @@ def _read_asset(name: str) -> str:
         return ""
 
 
-_PROXY_JS = _read_asset("opus_proxy.js") + "\n" + _read_asset("auto_proxy.js")
+_PROXY_JS = (
+    f"window.__qcapMaxBytes={_MAX_UPLOAD_BYTES};\n"
+    + _read_asset("opus_proxy.js") + "\n" + _read_asset("auto_proxy.js")
+)
 
 # Deployed browsers cannot reach the API port, so clips cross this process:
 # frontend/media_store.py sends them in 4MB slices and publishes the previews
@@ -70,13 +80,18 @@ def prune_renders(job_ids):
 
 
 def source_is_video() -> bool:
-    """The picked clip was a video, whose soundtrack is uploaded first."""
-    return media_store.is_audio_proxy((ss.get("file_meta") or {}).get("name") or "")
+    """The picked clip was a video (a direct-upload carrier or legacy .audio.ogg)."""
+    meta = ss.get("file_meta") or {}
+    if meta.get("carrier"):
+        return bool(meta.get("is_video"))
+    return media_store.is_audio_proxy(meta.get("name") or "")
 
 
 def source_video_name() -> str:
-    name = (ss.get("file_meta") or {}).get("name") or ""
-    return media_store.proxy_source_name(name) or name
+    meta = ss.get("file_meta") or {}
+    if meta.get("carrier"):
+        return meta.get("name") or "video"
+    return media_store.proxy_source_name(meta.get("name") or "") or (meta.get("name") or "video")
 
 
 def poll_align_job(jid: str, status):
@@ -159,9 +174,10 @@ def poll_align_job(jid: str, status):
 def ensure_render_video(vfile) -> str | None:
     """Put the picked video on the engine once; None on success.
 
-    The transfer is ~0.4 MB/s on the free host, so it starts as soon as the
-    file is picked (hidden uploader in step 1) instead of waiting for the
-    align to finish — otherwise the render step sits on it for minutes."""
+    This is the LAST-RESORT path: the browser streams the picked video
+    straight to the engine on its own (that is what runs in parallel with
+    the align), so this only fires when that direct transfer never landed
+    and the user picks the file again in the export card."""
     if vfile is None:
         return None
     file_id = getattr(vfile, "file_id", None)
@@ -183,31 +199,6 @@ def ensure_render_video(vfile) -> str | None:
         return f"Video upload failed: {api_error(up)}"
     ss["video_uploaded"] = True
     return None
-
-
-def video_prefetch() -> None:
-    """Hidden uploader that carries the burn-in video to the engine.
-
-    It must be rendered on EVERY script run: Streamlit drops the state of a
-    widget whose run does not render it, so skipping this block during the
-    blocking align or in the result view deleted the file mid-transfer and
-    the render step asked for the video all over again. The transfer also
-    starts here, in parallel with the align — it takes ~2 minutes on the
-    free host, longer than the align itself."""
-    if not (ss.get("media_id") and source_is_video()
-            and not ss.get("video_uploaded")):
-        return
-    with st.container(key=f"video_prefetch_{ss['media_id']}"):
-        pfile = st.file_uploader(
-            "Video for the burned-in MP4",
-            type=["mp4", "webm", "mov", "avi", "mkv"],
-            label_visibility="collapsed",
-            key=f"video_uploader_{ss['media_id']}",
-        )
-    if pfile is not None:
-        err = ensure_render_video(pfile)
-        if err:
-            st.caption(err + " You can pick the video again at the render step.")
 
 
 @st.cache_resource
@@ -448,10 +439,10 @@ a.dl-btn {
 a.dl-btn:hover { filter: brightness(1.07); }
 a.dl-btn:active { transform: translateY(1px); }
 
-/* The burn-in video starts transferring the moment a clip is picked, so it
-   is already on the engine when the render step opens; the uploader itself
-   is filled by auto_proxy.js and has no reason to be on screen. */
-div[class*="st-key-video_prefetch"] { display: none !important; }
+/* Streamlit renders a chip for the uploaded (carrier) file; the app shows the
+   real file's name and size itself, so the chip is hidden. */
+[data-testid="stFileUploaderFile"],
+[data-testid="stFileUploaderFileName"] { display: none !important; }
 
 /* ---------- Selectable chips ---------- */
 button[data-testid^="stBaseButton-segmented_control"],
@@ -538,7 +529,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-MAX_SIZE = int(os.environ.get("QCAP_MAX_MB", "400")) * 1024 * 1024
+MAX_SIZE = _MAX_UPLOAD_BYTES
 
 PRESETS = {
     "Classic": {"font_size": 48, "font_family": "Segoe UI", "font_color": "#FFFFFF",
@@ -639,6 +630,7 @@ ss.setdefault("video_meta", None)
 # upload only sends the audio, so the picture arrives later.
 ss.setdefault("preview_video_uri", None)
 ss.setdefault("preview_video_tried", False)
+ss.setdefault("media_upload_pct", None)
 
 
 def api_error(resp: requests.Response):
@@ -850,6 +842,10 @@ if (!window.__qcap) {{
   function localBlob() {{
     var f = window.__qcapSource;
     if (!f) return null;
+    // Only a real picture goes into the video tag — an audio pick keeps the
+    // engine's static URL (playing mp3 from a Blob into a video element is
+    // not reliably supported).
+    if (window.__qcapSourceIsVideo === false) return null;
     try {{
       if (window.__qcapBlobSrc && window.__qcapBlobFor === f) return window.__qcapBlobSrc;
       if (window.__qcapBlobSrc) {{ try {{ URL.revokeObjectURL(window.__qcapBlobSrc); }} catch (e) {{}} }}
@@ -1074,7 +1070,10 @@ def media_bytes():
     Session bytes are dropped right after the first successful upload (they
     would otherwise pin the whole file in RAM forever — a 400MB clip plus
     Streamlit plus the API child does not fit a 512MB host). Re-reads from
-    the uploader widget when needed (engine restart / legacy session)."""
+    the uploader widget when needed (engine restart / legacy session).
+    Carrier sessions never hold bytes."""
+    if carrier_mode():
+        return None
     if ss.get("file_bytes") is not None:
         return ss["file_bytes"]
     up = st.session_state.get("file_uploader")
@@ -1091,6 +1090,64 @@ def drop_media_bytes():
     ss["file_bytes"] = None
 
 
+def carrier_mode() -> bool:
+    return bool((ss.get("file_meta") or {}).get("carrier"))
+
+
+def align_src_ready() -> bool:
+    """For carrier clips the engine already holds (or is receiving) the
+    bytes — wait until the copy is complete before aligning by media_id,
+    or the engine would read a truncated file. Legacy clips upload
+    through the app at Generate time and are handled there instead."""
+    if not carrier_mode():
+        return True
+    mid = ss.get("media_id")
+    if not mid:
+        return False
+    st_ = media_store.engine_media_status(API_URL, mid, timeout=5)
+    if st_ is None:
+        ss["media_upload_pct"] = None  # engine unreachable — retry on click
+        return False
+    total = st_["total"] or 0
+    ss["media_upload_pct"] = int(min(100, (100 * st_["size"] / total))) if total else 0
+    if st_["complete"]:
+        ss["media_uploaded"] = True
+        return True
+    return False
+
+
+@st.fragment(run_every=2.0)
+def _video_upload_watch():
+    """Live progress of the direct-to-engine video upload (the picture).
+
+    Kept tiny on purpose: only it re-runs every 2s, not the whole app.
+    On completion the preview swaps to the real picture and the render
+    unlocks (via one full rerun)."""
+    mid = ss.get("video_media_id")
+    if not mid or ss.get("video_uploaded"):
+        return
+    st_ = media_store.engine_media_status(API_URL, mid, timeout=5)
+    if st_ is None:
+        st.caption("Checking the video upload…")
+        return
+    total = st_["total"] or 0
+    size = st_["size"]
+    if st_["complete"] or (total and size >= total):
+        ss["video_uploaded"] = True
+        try:
+            url = publish_media(mid)
+        except Exception:
+            url = None
+        if url:
+            ss["preview_video_uri"] = url
+            ss["preview_video_tried"] = True
+        st.rerun()
+        return
+    pct = (size / total) if total else 0.0
+    st.progress(min(max(pct, 0.0), 0.99),
+                text=f"The picture is uploading … {size / 1e6:.0f} of {total / 1e6:.0f} MB — needed only for the MP4")
+
+
 def ensure_media():
     """Resolve a playable preview for the server-side media copy.
 
@@ -1102,6 +1159,11 @@ def ensure_media():
     if ss["media_id"] is None:
         return
     if not ss.get("media_uploaded"):
+        if carrier_mode():
+            # The bytes live in the browser's direct upload; this process
+            # has nothing to re-send — ask the user to pick the file again.
+            st.warning("The caption engine restarted and lost the file — re-select it to upload again.")
+            return
         payload = media_bytes()
         if payload is None:
             st.warning("Video preview unavailable: re-select the file to upload it again.")
@@ -1192,17 +1254,6 @@ def show_detection(result: dict):
             st.caption(f"Engine note — {result['engine_note']}")
 
 
-# ------------------------------------------------- The picture's own transfer
-# Rendered once, at a fixed spot outside every card and branch, so it exists
-# in EVERY script run at the same element-tree position — including the run
-# that blocks inside the align, and the result view that replaces step 1.
-# Streamlit drops the state of a widget a run does not render, and moving the
-# element between cards re-mounts the uploader and aborts the transfer in
-# flight (both were measured: the file was lost and the render step asked for
-# the video again). It has to start with the align, not after it: the transfer
-# takes ~2 minutes on the free host, longer than the align itself.
-video_prefetch()
-
 # ---------------------------------------------------------------- Step 1: upload
 if ss["align_result"] is None:
     with st.container(border=True, key="card_upload"):
@@ -1214,7 +1265,9 @@ if ss["align_result"] is None:
 
         uploaded = st.file_uploader(
             "Choose a video — or an audio file",
-            type=["mp4", "webm", "mov", "avi", "mp3", "wav", "m4a", "ogg"],
+            # "qcap" is the tiny carrier the browser hands over (it never
+            # carries media bytes); real picks use the media extensions.
+            type=["mp4", "webm", "mov", "avi", "mkv", "mp3", "wav", "m4a", "ogg", "qcap"],
             label_visibility="collapsed",
             key="file_uploader",
         )
@@ -1222,23 +1275,69 @@ if ss["align_result"] is None:
             st.html(f"<script>{_PROXY_JS}</script>", unsafe_allow_javascript=True)
 
         if uploaded is not None:
-            if uploaded.size > MAX_SIZE:
+            # A direct-upload carrier (JSON, produced by frontend/auto_proxy.js)
+            # means the browser is streaming the real file straight to the
+            # engine — Streamlit only ever holds this ~200-byte document.
+            carrier = (media_store.parse_carrier(uploaded.getvalue())
+                       if media_store.is_carrier(uploaded.name or "") else None)
+            if media_store.is_carrier(uploaded.name or "") and carrier is None:
+                st.error("Unrecognized upload carrier — pick your recording again.")
+                st.stop()
+            if carrier and carrier.get("too_large"):
                 st.error(
                     f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — "
                     "trim long recordings before uploading on mobile."
                 )
                 st.stop()
+            carrier = carrier if (carrier and not carrier.get("too_large")) else None
+            big = carrier["size"] if carrier else uploaded.size
+            if big > MAX_SIZE:
+                st.error(
+                    f"File too large. Maximum {MAX_SIZE // (1024 * 1024)}MB — "
+                    "trim long recordings before uploading on mobile."
+                )
+                st.stop()
+            meta_name = carrier["name"] if carrier else uploaded.name
+            meta_type = carrier["type"] if carrier else (uploaded.type or "")
+            meta_file_id = getattr(uploaded, "file_id", None)
             is_new = (
                 ss["file_meta"] is None
-                or uploaded.name != ss["file_meta"].get("name")
+                or meta_name != ss["file_meta"].get("name")
                 or getattr(uploaded, "file_id", None) != ss["file_meta"].get("file_id")
             )
             if is_new:
                 prune_static([ss.get("media_id"), ss.get("video_media_id")])
                 prune_renders([ss.get("render_file")])
                 ss["render_file"] = None
-                ss["file_bytes"] = uploaded.getvalue()
-                ss["file_meta"] = {"name": uploaded.name, "type": uploaded.type, "file_id": getattr(uploaded, "file_id", None)}
+                if carrier:
+                    # The engine (not this process) holds the bytes.
+                    ss["file_bytes"] = None
+                    ss["media_id"] = carrier["media_id"]
+                    ss["media_uploaded"] = True
+                    ss["video_media_id"] = carrier.get("video_media_id")
+                    ss["video_uploaded"] = False
+                    ss["video_meta"] = (
+                        {"name": carrier["name"], "size": carrier["size"], "file_id": None}
+                        if carrier["is_video"] else None
+                    )
+                else:
+                    ss["file_bytes"] = uploaded.getvalue()
+                    ss["media_id"] = uuid.uuid4().hex[:10]
+                    ss["media_uploaded"] = False
+                    ss["video_media_id"] = None
+                    ss["video_uploaded"] = False
+                    ss["video_meta"] = None
+                ss["file_meta"] = {
+                    "name": meta_name,
+                    "type": meta_type,
+                    "file_id": meta_file_id,
+                    "size": big,
+                    "is_video": bool(carrier["is_video"]) if carrier else (
+                        (meta_type or "").startswith("video/")
+                        or meta_name.lower().endswith((".mp4", ".webm", ".mov", ".avi", ".mkv"))
+                    ),
+                    "carrier": bool(carrier),
+                }
                 ss["align_result"] = None
                 ss["align_key"] = None
                 ss["align_job_id"] = None
@@ -1250,20 +1349,22 @@ if ss["align_result"] is None:
                 ss["render_job_id"] = None
                 ss["render_url"] = None
                 ss["render_name"] = None
-                ss["media_id"] = uuid.uuid4().hex[:10]
                 ss["media_url"] = None
-                ss["media_uploaded"] = False
-                ss["video_media_id"] = None
-                ss["video_uploaded"] = False
-                ss["video_meta"] = None
                 ss["preview_video_uri"] = None
                 ss["preview_video_tried"] = False
+                ss["media_upload_pct"] = None
             if source_is_video():
                 st.caption(
-                    f"Video received: **{source_video_name()}** — only its soundtrack "
-                    "was sent ahead so captions can start now. The picture plays "
-                    "from your device straight away; the full video uploads in "
-                    "the background for the burn-in, and the MP4 keeps your video."
+                    f"Video received: **{source_video_name()}** — the captions start "
+                    "from its soundtrack, which is already on the caption engine; the "
+                    "picture streams straight to it in the background for the burn-in, "
+                    "and the MP4 keeps your video."
+                )
+            elif carrier and not carrier.get("is_video"):
+                _size = ss["file_meta"].get("size") or carrier["size"]
+                st.caption(
+                    f"Received: **{meta_name}** ({_size / 1e6:.1f} MB) — streaming to the "
+                    "caption engine. Captions can start as soon as it lands."
                 )
 
         has_file = ss["file_bytes"] is not None or ss.get("media_uploaded")
@@ -1291,9 +1392,21 @@ if ss["align_result"] is None:
             # idempotent (the engine returns the job it already started) and
             # `align_job_id` resumes polling after a rerun.
             if generate and not ss.get("align_key"):
-                if not ss.get("media_id"):
-                    ss["media_id"] = uuid.uuid4().hex[:10]
-                ss["align_key"] = uuid.uuid4().hex
+                if carrier_mode() and not align_src_ready():
+                    # The engine streams the file in itself; aligning by
+                    # media_id before the last slice lands would read a
+                    # truncated file, so the align waits for completeness.
+                    pct = ss.get("media_upload_pct")
+                    st.info(
+                        (f"The file is still uploading — **{pct}%** complete. "
+                         if pct is not None else
+                         "The caption engine is still receiving the file — ")
+                        + "captions start the moment it lands. Press Generate again."
+                    )
+                else:
+                    if not ss.get("media_id"):
+                        ss["media_id"] = uuid.uuid4().hex[:10]
+                    ss["align_key"] = uuid.uuid4().hex
 
             if ss.get("align_key"):
                 with st.status("Running speech recognition + surah detection…", expanded=False) as status:
@@ -1492,75 +1605,65 @@ if ss["align_result"] is not None and ss["segments"]:
             st.caption("This free host renders up to 720p — 1080p exceeds its memory limit.")
         res_w, res_h = RESOLUTIONS[res_label]
 
-        # An audio upload has no picture to burn the captions into, so the
-        # matching video is asked for here (once, at render time). A video
-        # picked in step 1 arrives as its soundtrack first
-        # (frontend/auto_proxy.js) and is auto-filled here in the background —
-        # that upload is the picture the MP4 must use, never the proxy.
+        # A video picked in step 1 streams straight to the engine (never
+        # through Streamlit); the MP4 burns into THAT upload. An audio pick
+        # has no picture, so the video is asked for here (once, at render
+        # time).
         _meta = ss.get("file_meta") or {}
-        _name = (_meta.get("name") or "").lower()
-        _audio_only = (_meta.get("type") or "").startswith("audio/") or _name.endswith(
-            (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac", ".opus")
-        )
         _from_video = source_is_video()
         _vup = bool(ss.get("video_uploaded"))
-        if _audio_only:
-            if _from_video:
-                # The transfer itself is owned by the top-level prefetch
-                # uploader (it outlives the step cards); here only its state
-                # is shown, plus a manual fallback with its own widget key.
-                if _vup:
-                    st.caption(f"Video: {source_video_name()}")
-                    st.success("Original video uploaded — ready to render.")
-                else:
-                    st.info(
-                        "Sending your video to the caption engine in the background. "
-                        "You can keep editing — rendering unlocks as soon as it lands."
-                    )
-                    _vfile = st.file_uploader(
-                        "If the transfer stalled, pick the video file again",
-                        type=["mp4", "webm", "mov", "avi", "mkv"],
-                        label_visibility="collapsed",
-                        key=f"video_uploader_fallback_{ss['media_id']}",
-                    )
-                    if _vfile is not None:
-                        _verr = ensure_render_video(_vfile)
-                        if _verr:
-                            st.error(_verr)
-                        else:
-                            st.rerun()
+        if _from_video:
+            if _vup:
+                st.caption(f"Video: {source_video_name()}")
+                st.success("Original video uploaded — ready to render.")
             else:
-                st.caption("The video the captions are burned into.")
-                # The uploader is only rendered until the video is on the
-                # engine: Streamlit keeps every uploaded file in memory
-                # (BytesIO) for as long as its widget exists, and a 40MB+
-                # video held for the rest of the session is part of what
-                # OOM-killed the 512MB host.
-                if not _vup:
-                    _vfile = st.file_uploader(
-                        "Video for the burned-in MP4",
-                        type=["mp4", "webm", "mov", "avi", "mkv"],
-                        label_visibility="collapsed",
-                        # A new clip gets a fresh widget, so the previous
-                        # clip's video can never be rendered under the new
-                        # captions.
-                        key=f"video_uploader_{ss['media_id']}",
-                    )
-                    if _vfile is not None:
-                        _verr = ensure_render_video(_vfile)
-                        if _verr:
-                            st.error(_verr)
-                        else:
-                            # Drop the uploader (and with it the in-memory
-                            # file) and swap the preview to the real picture.
-                            st.rerun()
-                    st.caption("Captions are burned into a picture — add the video to use.")
-                else:
-                    st.success("Original video uploaded — ready to render.")
+                # Live progress of the direct-to-engine transfer; the host
+                # must not stream it a second time for the render.
+                _video_upload_watch()
+                _vfile = st.file_uploader(
+                    "If the transfer stalled, pick the video file again",
+                    type=["mp4", "webm", "mov", "avi", "mkv"],
+                    label_visibility="collapsed",
+                    key=f"video_uploader_fallback_{ss['media_id']}",
+                )
+                if _vfile is not None:
+                    _verr = ensure_render_video(_vfile)
+                    if _verr:
+                        st.error(_verr)
+                    else:
+                        st.rerun()
+        else:
+            st.caption("The video the captions are burned into.")
+            # The uploader is only rendered until the video is on the
+            # engine: Streamlit keeps every uploaded file in memory
+            # (BytesIO) for as long as its widget exists, and a 40MB+
+            # video held for the rest of the session is part of what
+            # OOM-killed the 512MB host.
+            if not _vup:
+                _vfile = st.file_uploader(
+                    "Video for the burned-in MP4",
+                    type=["mp4", "webm", "mov", "avi", "mkv"],
+                    label_visibility="collapsed",
+                    # A new clip gets a fresh widget, so the previous
+                    # clip's video can never be rendered under the new
+                    # captions.
+                    key=f"video_uploader_{ss['media_id']}",
+                )
+                if _vfile is not None:
+                    _verr = ensure_render_video(_vfile)
+                    if _verr:
+                        st.error(_verr)
+                    else:
+                        # Drop the uploader (and with it the in-memory
+                        # file) and swap the preview to the real picture.
+                        st.rerun()
+                st.caption("Captions are burned into a picture — add the video to use.")
+            else:
+                st.success("Original video uploaded — ready to render.")
 
         # Without the picture there is nothing to burn into, so the render
         # stays locked instead of failing in FFmpeg (it needs a video stream).
-        _needs_video = _audio_only and not ss.get("video_uploaded")
+        _needs_video = not ss.get("video_uploaded")
         render_clicked = st.button(
             "Render MP4 with captions", type="primary", width="stretch",
             disabled=_needs_video, icon=":material/movie:",

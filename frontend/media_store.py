@@ -11,6 +11,7 @@ recitation crosses this process. Two rules keep a 512MB instance alive:
   as a base64 data URI in session_state.
 """
 import io
+import json
 import os
 import re
 import shutil
@@ -18,6 +19,9 @@ import shutil
 import requests
 
 CHUNK = 4 * 1024 * 1024
+
+CARRIER_SUFFIX = ".qcap"
+CARRIER_MAX_BYTES = 4096
 
 # The browser's fast upload sends a video's soundtrack as
 # "<original name>.audio.ogg" (frontend/auto_proxy.js). Only the soundtrack
@@ -37,6 +41,76 @@ def is_audio_proxy(name: str) -> bool:
 def proxy_source_name(name: str) -> str:
     """The video's own file name that an audio proxy was made from."""
     return _PROXY_RE.sub(r"\1", name or "")
+
+
+def is_carrier(name: str) -> bool:
+    return (name or "").lower().endswith(CARRIER_SUFFIX)
+
+
+def parse_carrier(data) -> dict | None:
+    """Decode the .qcap carrier the browser hands to the uploader.
+
+    The carrier is a tiny JSON document (well under a KB) describing the file
+    the user actually picked: the engine already holds the bytes (the browser
+    uploads them directly, never through Streamlit), so the app only needs
+    the ids and metadata. Returns None for anything that is not a valid
+    carrier — the caller then treats the upload as a plain file."""
+    if not data or len(data) > CARRIER_MAX_BYTES:
+        return None
+    try:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        doc = json.loads(data)
+    except Exception:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    media_id = doc.get("media_id")
+    name = doc.get("name")
+    if not isinstance(media_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", media_id):
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+
+    def _size(v) -> int:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, n)
+
+    video_id = doc.get("video_media_id")
+    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+        video_id = None
+    return {
+        "name": name,
+        "type": str(doc.get("type") or "application/octet-stream"),
+        "size": _size(doc.get("size")),
+        "is_video": bool(doc.get("is_video")),
+        "media_id": media_id,
+        "video_media_id": video_id,
+    }
+
+
+def engine_media_status(api_url: str, media_id: str, timeout: float = 5.0) -> dict | None:
+    """Poll the engine for a direct upload's progress.
+
+    Returns {"size", "total", "complete"} when the engine answers, else None
+    (engine unreachable — caller treats the upload as unknown, not failed)."""
+    try:
+        r = requests.get(f"{api_url}/media/{media_id}/status", timeout=timeout)
+        if r.status_code != 200:
+            return None
+        doc = r.json()
+        if not isinstance(doc, dict):
+            return None
+        return {
+            "size": int(doc.get("size") or 0),
+            "total": int(doc.get("total") or 0),
+            "complete": bool(doc.get("complete")),
+        }
+    except Exception:
+        return None
 
 
 def post_media(api_url: str, media_id: str, name: str, source, ctype: str = ""):

@@ -1,11 +1,12 @@
 import os
+import re
 import uuid
 import shutil
 import subprocess
 import threading
 import time
 import io
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
@@ -69,12 +70,26 @@ app = FastAPI(
 )
 
 
+def _resolve_media_path(media_id: str):
+    """MEDIA_FILES first, then the disk. A restart wipes the in-memory map
+    while the bytes survive in TEMP_DIR — reusing the disk copy keeps
+    uploaded clips playable/renderable instead of forcing a re-upload."""
+    path = MEDIA_FILES.get(media_id)
+    if path and os.path.exists(path):
+        return path
+    path = _verified_media_path(media_id)
+    if path and os.path.exists(path):
+        MEDIA_FILES[media_id] = path
+        return path
+    return None
+
+
 def _media_path_or_404(media_id: str) -> str:
     """Resolve a stored /media upload or 404 (engine restarted / unknown id).
     Lets /align and /render reuse the server-side copy so the client uploads
     the file ONCE instead of once per endpoint."""
-    path = MEDIA_FILES.get(media_id)
-    if not path or not os.path.exists(path):
+    path = _resolve_media_path(media_id)
+    if not path:
         raise HTTPException(status_code=404, detail="Media not found — re-upload the file")
     return path
 
@@ -965,6 +980,7 @@ async def _write_upload(file: UploadFile, path: str, offset: int = 0) -> int:
     A 40MB clip read (and multipart-parsed) in one go was enough to OOM the
     512MB free host, which restarted mid-upload."""
     os.makedirs(TEMP_DIR, exist_ok=True)
+    _sweep_media_dir(keep=path)
     if offset > 0 and os.path.exists(path):
         fh = open(path, "r+b")
     else:
@@ -978,6 +994,179 @@ async def _write_upload(file: UploadFile, path: str, offset: int = 0) -> int:
                 break
             fh.write(buf)
     return os.path.getsize(path)
+
+
+# ---------------------------------------------------------------- direct upload
+# The browser sends raw slices straight to this engine (the deployed reverse
+# proxy forwards only /engine/media/*), so no process ever holds the whole
+# clip in RAM. Slices are addressed by absolute offset, which makes the
+# client-side retry safe: re-sending slice N just rewrites the same bytes.
+MEDIA_DISK_CAP_MB = int(os.environ.get("QCAP_MEDIA_DISK_MB", "768"))
+MEDIA_MAX_FILE_MB = int(os.environ.get("QCAP_MEDIA_MAX_FILE_MB", "512"))
+_MEDIA_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _qcap_meta_path(media_id: str) -> str:
+    # Not a media_ file: the media sweep and the media_* globs ignore it.
+    return os.path.join(TEMP_DIR, f"qcapmeta_{media_id}")
+
+
+def _stored_media_path(media_id: str):
+    """Any stored copy of media_<id>.* on disk, whatever its size."""
+    try:
+        for n in os.listdir(TEMP_DIR):
+            if n.startswith(f"media_{media_id}."):
+                return os.path.join(TEMP_DIR, n)
+    except OSError:
+        pass
+    return None
+
+
+def _verified_media_path(media_id: str):
+    """A disk copy known to be complete (or a legacy copy with no sidecar).
+
+    Direct uploads write a qcapmeta_<id> sidecar with the declared total;
+    a smaller file is still arriving and must not be served for alignment,
+    playback or rendering. Entries without a sidecar predate the sidecar
+    and are trusted as complete."""
+    path = _stored_media_path(media_id)
+    if not path:
+        return None
+    try:
+        with open(_qcap_meta_path(media_id), encoding="utf-8") as m:
+            total = int(m.read().strip() or "0")
+    except Exception:
+        return path
+    try:
+        if total > 0 and os.path.getsize(path) < total:
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def _sweep_media_dir(keep: str | None = None):
+    """LRU-evict stored media when TEMP_DIR grows past the cap.
+
+    A public instance has no other bound on how much strangers can store,
+    and the free hosts share one small disk. Oldest copies go first, but
+    anything younger than 10 minutes is assumed to be part of a live
+    session (an align or a render in flight) and is left alone — better
+    to exceed the cap than to delete a file someone is using right now.
+    The file currently being written (`keep`) is never evicted."""
+    cap = MEDIA_DISK_CAP_MB * 1024 * 1024
+    now = time.time()
+    keep_path = os.path.abspath(keep) if keep else None
+    try:
+        names = [n for n in os.listdir(TEMP_DIR)
+                 if n.startswith("media_") or n.startswith("qcapmeta_")]
+        entries, total = [], 0
+        for n in names:
+            p = os.path.join(TEMP_DIR, n)
+            try:
+                st = os.stat(p)
+                sz = st.st_size
+                entries.append((st.st_mtime, p, sz))
+                total += sz
+            except OSError:
+                continue
+    except OSError:
+        return
+    if total <= cap:
+        return
+    for mtime, path, sz in sorted(entries, key=lambda e: e[0]):
+        if keep_path and os.path.abspath(path) == keep_path:
+            continue
+        if now - mtime < 600:
+            continue
+        try:
+            os.remove(path)
+            total -= sz
+        except OSError:
+            continue
+        for k, p in list(MEDIA_FILES.items()):
+            if p == path:
+                MEDIA_FILES.pop(k, None)
+        if total <= cap:
+            break
+
+
+def _valid_media_id(media_id: str) -> bool:
+    return bool(_MEDIA_ID_RE.fullmatch(media_id or ""))
+
+
+@app.get("/media/ping")
+def media_ping():
+    # Reachability probe for the browser, which can only see the engine
+    # through the reverse proxy — the app uses it to decide between the
+    # direct upload and the legacy (upload through Streamlit) path.
+    return {"ok": True}
+
+
+@app.post("/media/{media_id}/upload")
+async def upload_media_raw(media_id: str, request: Request,
+                           offset: int = 0, total: int = 0, ext: str = ".mp4"):
+    """One slice of a large upload, raw body. The browser slices the file
+    itself in 4MB pieces addressed by absolute offset; a dropped connection
+    is retried by re-sending the same bytes at the same offset."""
+    if not _valid_media_id(media_id):
+        raise HTTPException(status_code=400, detail="bad media id")
+    if offset < 0 or total < 0:
+        raise HTTPException(status_code=400, detail="bad offset/total")
+    if total > MEDIA_MAX_FILE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum {MEDIA_MAX_FILE_MB}MB")
+    path = _media_path(media_id, ext)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    _sweep_media_dir(keep=path)
+    if offset > 0:
+        if not os.path.exists(path):
+            raise HTTPException(status_code=409, detail="earlier slices are missing — restart the upload")
+        current = os.path.getsize(path)
+        if current != offset:
+            raise HTTPException(status_code=409,
+                                detail=f"offset mismatch: engine has {current} bytes, slice claims {offset}")
+        fh = open(path, "r+b")
+        fh.seek(offset)
+    else:
+        fh = open(path, "wb")
+    written = offset
+    buf = bytearray()
+    with fh:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            buf += chunk
+            if len(buf) >= (1 << 20):
+                written += fh.write(buf)
+                buf.clear()
+        if buf:
+            written += fh.write(buf)
+    try:
+        with open(_qcap_meta_path(media_id), "w", encoding="utf-8") as m:
+            m.write(str(total or 0))
+    except OSError:
+        pass
+    size = os.path.getsize(path)
+    complete = bool(total > 0 and size >= total)
+    if complete:
+        MEDIA_FILES[media_id] = path
+    return {"received": size, "complete": complete}
+
+
+@app.get("/media/{media_id}/status")
+def media_status(media_id: str):
+    if not _valid_media_id(media_id):
+        raise HTTPException(status_code=400, detail="bad media id")
+    path = _stored_media_path(media_id)
+    size = os.path.getsize(path) if path else 0
+    try:
+        with open(_qcap_meta_path(media_id), encoding="utf-8") as m:
+            total = int(m.read().strip() or "0")
+    except Exception:
+        total = 0
+    complete = bool(path and total > 0 and size >= total)
+    return {"id": media_id, "size": size, "total": total,
+            "complete": complete}
 
 
 @app.post("/media/{media_id}")
@@ -1008,8 +1197,8 @@ async def upload_media_chunk(
 
 @app.get("/media/{media_id}")
 async def get_media(media_id: str):
-    path = MEDIA_FILES.get(media_id)
-    if not path or not os.path.exists(path):
+    path = _resolve_media_path(media_id)
+    if not path:
         raise HTTPException(status_code=404, detail="Media not found")
     # Serve the real content type: the fast-upload path stores an Ogg/Opus
     # audio proxy, and labelling it video/mp4 makes some players refuse it.
@@ -1020,8 +1209,8 @@ async def get_media(media_id: str):
 def media_preview(media_id: str):
     """Low-res transcoded preview for embedding as a data URI (browser can't
     reach the API port directly on Spaces, so bytes must be small)."""
-    path = MEDIA_FILES.get(media_id)
-    if not path or not os.path.exists(path):
+    path = _resolve_media_path(media_id)
+    if not path:
         raise HTTPException(status_code=404, detail="Media not found")
     out = os.path.join(TEMP_DIR, f"preview_{media_id}.mp4")
     # An audio-only source (the fast-upload proxy) needs no video
@@ -1070,8 +1259,8 @@ def _cache_key(path: str) -> tuple[str, float]:
 
 
 def _sync_layers_for(media_id: str, max_points: int) -> dict:
-    path = MEDIA_FILES.get(media_id)
-    if not path or not os.path.exists(path):
+    path = _resolve_media_path(media_id)
+    if not path:
         raise HTTPException(status_code=404, detail="Media not found")
     key = (_cache_key(path), int(max_points))
     with _SYNC_CACHE_LOCK:

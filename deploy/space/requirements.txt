@@ -17,6 +17,10 @@ starlette==0.47.3
 jinja2>=3.1.0
 imageio-ffmpeg>=0.4.9
 requests>=2.31.0
+# reverse proxy for the single public port (deploy/render/proxy.py): the
+# browser streams media straight to the engine through it — bytes never
+# enter Streamlit (this is what stopped the upload OOM-kills)
+aiohttp>=3.9.0
 groq>=0.35
 elevenlabs>=2.0.0
 onnxruntime>=1.17.0

@@ -1,41 +1,58 @@
-/* Automatic fast upload for video files.
+/* Direct-to-engine upload.
  *
- * Captioning only needs the AUDIO of a video. When a video is picked, the
- * browser extracts its soundtrack (opus_proxy.js), uploads that small file
- * instead, and keeps the original video in memory: the burn-in step then
- * uploads it for real while the user is editing styles, so the heavy
- * transfer no longer stands between the user and their captions.
+ * Browsers used to hand the whole clip to Streamlit's own file uploader,
+ * which reads the entire body into RAM on the caption host and OOM-killed the
+ * free 512MB instance mid-upload — "the upload takes forever and crashes".
  *
- * Falls back to uploading the original file whenever anything is missing
- * (no WebCodecs, clip too long to decode in memory, extraction error).
+ * Now the picked file goes straight to the caption engine over the same
+ * origin (/engine/media/..., a small reverse proxy forwards only those
+ * routes), sliced into 4MB pieces addressed by absolute offset. Streamlit
+ * only ever receives a tiny .qcap carrier (JSON) describing the file, so
+ * neither process ever holds the clip in memory and the upload is limited
+ * only by the user's connection.
+ *
+ * Soundtrack-first: for media files the browser also extracts a small Opus
+ * soundtrack (opus_proxy.js) and uploads THAT first, so captions can start
+ * while the picture is still on its way. If anything about extraction is
+ * unavailable or fails, the engine aligns on the raw upload instead —
+ * ffmpeg decodes it server-side, just later.
+ *
+ * Fallback: if the /engine route answers 404/fails (plain local dev without
+ * the proxy), the picked file goes through Streamlit's uploader exactly as
+ * before, so the app keeps working everywhere.
  */
 (function () {
   'use strict';
   if (window.__qcapAutoBound) { return; }
   window.__qcapAutoBound = true;
 
-  var injecting = false;
+  // Soundtrack extraction is only worth it above this size; below it the
+  // decode would cost more than the upload saves.
+  var MIN_PROXY_BYTES = 4 * 1024 * 1024;
   // Decoding holds the whole clip as PCM; 40 minutes stereo at 16 kHz is
   // ~300 MB, past which mobile browsers start to die.
   var MAX_PROXY_SECONDS = 2400;
-  // Below this the video is no slower to upload than its audio.
-  var MIN_PROXY_BYTES = 4 * 1024 * 1024;
+  var CHUNK_BYTES = 4 * 1024 * 1024;
+  // Server-side cap is authoritative (Python enforces it too, and the engine
+  // answers 413); the app tells us its configured cap via this global.
+  var DEFAULT_MAX_BYTES = 512 * 1024 * 1024;
 
   function fmtSize(n) {
     if (n >= 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
     return Math.max(1, Math.round(n / 1024)) + ' KB';
   }
 
-  function uploaderInputs() {
-    return Array.prototype.slice.call(
-      document.querySelectorAll('[data-testid="stFileUploaderDropzoneInput"]'));
+  function maxBytes() {
+    var v = Number(window.__qcapMaxBytes);
+    return (v > 0 ? v : DEFAULT_MAX_BYTES);
   }
 
-  // The burn-in uploader lives in a keyed Streamlit container named
-  // st-key-video_uploader_..., so its input can be told apart from the
-  // step-1 uploader even when it is the only one on the page.
-  function burnInBox() {
-    return document.querySelector('[class*="st-key-video_uploader"]');
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function uploaderInput() {
+    var host = document.querySelector('[class*="st-key-file_uploader"]');
+    if (!host || !host.querySelector) { return null; }
+    return host.querySelector('input[type=file]');
   }
 
   function note(msg, bad) {
@@ -60,24 +77,93 @@
     return /\.(mp4|webm|mov|avi|mkv|m4v|ogv)$/i.test(f.name || '');
   }
 
-  function hideNoteSoon(ms) {
-    setTimeout(function () {
-      var el = document.getElementById('qcap-proxy-note');
-      if (el && el.parentNode) { el.parentNode.removeChild(el); }
-    }, ms || 6000);
+  function isAudio(f) {
+    if (/^audio\//.test(f.type || '')) { return true; }
+    return /\.(mp3|wav|m4a|ogg|aac|flac|opus)$/i.test(f.name || '');
+  }
+
+  function extOf(name) {
+    var m = /\.([A-Za-z0-9]{1,8})$/.exec(name || '');
+    return m ? '.' + m[1].toLowerCase() : '';
+  }
+
+  function baseOf(name) {
+    return String(name || 'clip').replace(/\.[^.]+$/, '');
+  }
+
+  function uid() {
+    if (window.crypto && crypto.randomUUID) { return crypto.randomUUID().replace(/-/g, ''); }
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+
+  // Stream a file to the engine in CHUNK_BYTES slices addressed by absolute
+  // offset. Each slice is retried a few times; a dropped connection just
+  // re-sends that slice at the same offset, never corrupts the file.
+  async function streamToEngine(file, mediaId, ext, onProgress) {
+    var total = file.size;
+    var offset = 0;
+    var restarts = 0;
+    while (offset < total) {
+      var end = Math.min(total, offset + CHUNK_BYTES);
+      var slice = file.slice(offset, end);
+      var attempt = 0;
+      for (;;) {
+        try {
+          var resp = await fetch('/engine/media/' + mediaId + '/upload?offset=' + offset
+              + '&total=' + total + '&ext=' + encodeURIComponent(ext), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: slice,
+          });
+          if (resp.ok) { break; }
+          if (resp.status === 413) { throw new Error('file exceeds the server limit'); }
+          // 409 means the engine's copy is behind or ahead of us;
+          // restart the whole transfer from zero.
+          if (resp.status === 409) {
+            restarts += 1;
+            if (restarts > 2) { throw new Error('the server rejected the upload'); }
+            offset = -1;
+            break;
+          }
+          attempt += 1;
+          if (attempt >= 4) { throw new Error('upload failed (HTTP ' + resp.status + ')'); }
+        } catch (e) {
+          attempt += 1;
+          if (attempt >= 4) { throw e; }
+        }
+        await sleep(1000 * attempt);
+      }
+      if (offset === -1) { offset = 0; continue; }
+      offset = end;
+      if (onProgress) { onProgress(offset, total); }
+    }
+  }
+
+  function engineAvailable() {
+    // The engine answers with JSON; a host without the proxy answers with
+    // the app's HTML page (HTTP 200 as well), which must NOT pass here —
+    // otherwise uploads would 404 instead of falling back to the legacy path.
+    return fetch('/engine/media/ping', { method: 'GET' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { return !!(d && d.ok === true); })
+      .catch(function () { return false; });
   }
 
   function hand(input, file) {
     var dt = new DataTransfer();
     dt.items.add(file);
     input.files = dt.files;
-    injecting = true;
+    try { window.__qcapInjecting = true; } catch (e) {}
     try {
       input.dispatchEvent(new Event('change', { bubbles: true }));
     } finally {
-      setTimeout(function () { injecting = false; }, 0);
+      setTimeout(function () { window.__qcapInjecting = false; }, 0);
     }
-    hideNoteSoon();
+  }
+
+  function makeCarrier(doc) {
+    var bytes = new TextEncoder().encode(JSON.stringify(doc));
+    return new File([bytes], 'caption_carrier.qcap', { type: 'application/qcap' });
   }
 
   function probeDuration(file) {
@@ -90,7 +176,7 @@
         done = true;
         try {
           v.removeAttribute('src');
-          v.load();  // stop buffering before the blob URL disappears
+          v.load();
           URL.revokeObjectURL(url);
         } catch (e) {}
         resolve(sec);
@@ -105,69 +191,126 @@
     });
   }
 
-  // Capture phase on the document: Streamlit's own change handler sits on
-  // the React root, so stopping propagation here keeps the raw video from
-  // starting a full-size upload. The proxy goes over a moment later.
+  var pickSeq = 0;
+
+  // Capture phase: Streamlit's own change handler sits on the React root, so
+  // stopping propagation here keeps the raw clip out of Streamlit entirely.
   document.addEventListener('change', function (ev) {
     var input = ev.target;
-    if (!input || input.type !== 'file' || injecting) { return; }
-    if (input.getAttribute('data-qcap-burnin')) { return; }
-    // A manual pick in the burn-in uploader IS the picture the user chose:
-    // proxying it would hand that uploader an .ogg it cannot accept.
-    var vbox = burnInBox();
-    if (vbox && vbox.contains && vbox.contains(input)) { return; }
-    var inputs = uploaderInputs();
-    if (inputs.length === 0 || input !== inputs[0]) { return; }
+    if (!input || input.type !== 'file' || window.__qcapInjecting) { return; }
+    var uploader = uploaderInput();
+    if (!uploader || input !== uploader) { return; }
     var f = input.files && input.files[0];
-    if (!f || !isVideo(f) || !window.QcapProxy) { return; }
-    if (f.size < MIN_PROXY_BYTES) { return; }
+    if (!f) { return; }
+    if (/\.qcap$/i.test(f.name || '')) { return; }
 
     ev.stopPropagation();
     ev.stopImmediatePropagation();
-    window.__qcapSource = f;
-    window.__qcapSourceUsed = false;
-    note('Preparing the audio …');
 
-    probeDuration(f).then(function (sec) {
-      if (sec > MAX_PROXY_SECONDS) {
-        throw new Error('clip too long to extract in the browser');
+    var seq = ++pickSeq;
+    var isVid = isVideo(f);
+    window.__qcapSource = f;
+    window.__qcapSourceIsVideo = isVid;
+
+    if (f.size > maxBytes()) {
+      window.__qcapSource = null;
+      note('This file is too large — the limit is ' + fmtSize(maxBytes()) + '.', true);
+      hand(input, makeCarrier({
+        media_id: uid(), name: f.name || 'clip', type: f.type || '',
+        size: f.size, is_video: isVid, too_large: true,
+      }));
+      return;
+    }
+
+    note('Sending your file to the caption engine …');
+
+    engineAvailable().then(function (ok) {
+      if (!ok) {
+        // Plain local dev (no proxy in front): the only path that works is
+        // Streamlit's own uploader, exactly as before.
+        note('Direct upload unavailable here — sending the file through the app.', true);
+        window.__qcapSource = f;
+        hand(input, f);
+        return;
       }
-      return window.QcapProxy.buildAudioProxy(f, { bitrate: 32000, format: 'ogg_opus' });
-    }).then(function (res) {
-      // Keep the video's own name and extension in the proxy name: the app
-      // reads a name ending in ".audio.ogg" as a picked video's soundtrack
-      // and refuses to render the MP4 from it (frontend/media_store.py).
-      var base = f.name || 'clip.mp4';
-      res.file = new File([res.file], base + '.audio.ogg', { type: 'audio/ogg' });
-      window.__qcapProxyFile = res.file;
-      note('Video accepted — sending its soundtrack (' + fmtSize(res.bytes)
-           + ' of ' + fmtSize(f.size) + ') first');
-      hand(input, res.file);
-    }).catch(function () {
-      note('Could not extract the audio — uploading the video itself.', true);
-      hand(input, f);
+
+      var rawId = uid();
+      var rawExt = extOf(f.name) || (isVid ? '.mp4' : '.mp3');
+      var rawStarted = false;
+      var carrierHanded = false;
+
+      // The raw bytes are needed for the burn-in render, not for captions.
+      // They go after the soundtrack so the soundtrack gets the whole pipe:
+      // captions start seconds sooner. The exception is when there is no
+      // soundtrack path at all — then the raw upload goes immediately.
+      function startRaw() {
+        if (rawStarted) { return; }
+        rawStarted = true;
+        streamToEngine(f, rawId, rawExt, function (o, t) {
+          if (seq !== pickSeq) { return; }
+          if (carrierHanded && o >= t) {
+            note('Video uploaded — ready to render.');
+            return;
+          }
+          note('The picture is still uploading … ' + Math.floor((o * 100) / t) + '%');
+        }).catch(function () {
+          if (seq === pickSeq) {
+            note('The upload stopped — please pick the file again.', true);
+          }
+        });
+      }
+
+      function deliverCarrier(alignId) {
+        if (seq !== pickSeq || carrierHanded) { return; }
+        carrierHanded = true;
+        var carrier = makeCarrier({
+          name: f.name || 'clip', type: f.type || 'application/octet-stream',
+          size: f.size, is_video: isVid, media_id: alignId,
+          video_media_id: isVid ? rawId : null,
+        });
+        hand(input, carrier);
+      }
+
+      var extractable = (isVid || isAudio(f))
+        && f.size >= MIN_PROXY_BYTES
+        && window.QcapProxy;
+
+      if (!extractable) {
+        // No soundtrack detour: raw upload starts now and carries the captions.
+        startRaw();
+        deliverCarrier(rawId);
+        return;
+      }
+
+      probeDuration(f).then(function (sec) {
+        if (sec > MAX_PROXY_SECONDS) { throw new Error('clip too long to extract'); }
+        return window.QcapProxy.buildAudioProxy(f, { bitrate: 32000, format: 'ogg_opus' });
+      }).then(function (res) {
+        var aid = uid();
+        var pf = new File([res.file], baseOf(f.name) + '.audio.ogg', { type: 'audio/ogg' });
+        return streamToEngine(pf, aid, '.ogg', function (o, t) {
+          if (seq === pickSeq) {
+            note('Sending the soundtrack … ' + Math.floor((o * 100) / t) + '%');
+          }
+        }).then(function () { return aid; });
+      }).then(function (aid) {
+        if (seq !== pickSeq) { return; }
+        if (!aid) {
+          // Extraction produced nothing: captions must use the raw file.
+          note('Could not extract the audio — captions will use the file itself.', true);
+          startRaw();
+          deliverCarrier(rawId);
+          return;
+        }
+        note('Soundtrack sent — captions can start. The rest uploads now.');
+        deliverCarrier(aid);
+        startRaw();
+      }).catch(function () {
+        if (seq !== pickSeq) { return; }
+        note('Could not extract the audio — captions will use the file itself.', true);
+        startRaw();
+        deliverCarrier(rawId);
+      });
     });
   }, true);
-
-  // The burn-in step asks for the video the captions are burned into. That
-  // file is already in memory, so fill the uploader automatically and let
-  // the full-size upload run while the user edits styles.
-  function fillBurnIn() {
-    if (!window.__qcapSource || window.__qcapSourceUsed) { return; }
-    var box = burnInBox();
-    var target = box ? box.querySelector('input[type=file]') : null;
-    if (!target) {
-      // Before the burn-in step mounts, the only uploader is step 1 — never
-      // refill that one with the video.
-      var inputs = uploaderInputs();
-      if (inputs.length < 2) { return; }
-      target = inputs[inputs.length - 1];
-    }
-    if (target.files && target.files.length) { return; }
-    window.__qcapSourceUsed = true;
-    target.setAttribute('data-qcap-burnin', '1');
-    note('Video ' + fmtSize(window.__qcapSource.size) + ' uploading in the background');
-    hand(target, window.__qcapSource);
-  }
-  setInterval(fillBurnIn, 1500);
 })();

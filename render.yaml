@@ -26,7 +26,13 @@ services:
     plan: free
     region: oregon
     buildCommand: pip install -r deploy/space/requirements.txt
-    startCommand: streamlit run frontend/app.py --server.port $PORT --server.address 0.0.0.0 --server.fileWatcherType none --server.headless true --server.enableCORS false --server.enableXsrfProtection true
+    # deploy/render/proxy.py listens on $PORT and forwards:
+    #   /engine/media/{ping,upload,chunk,status} -> caption engine :8000
+    #   everything else (pages, static, the /_stcore websocket) -> Streamlit :8501
+    # Big files stream browser→engine through it instead of through
+    # Streamlit's own uploader, which buffered them in RAM and OOM-killed
+    # the 512MB instance mid-upload.
+    startCommand: python deploy/render/proxy.py
     healthCheckPath: /_stcore/health
     envVars:
       - key: PYTHON_VERSION
