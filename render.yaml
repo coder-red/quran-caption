@@ -26,12 +26,17 @@ services:
     plan: free
     region: oregon
     buildCommand: pip install -r deploy/space/requirements.txt
-    # deploy/render/proxy.py listens on $PORT and forwards:
+    # The pinned start command on the dashboard is `streamlit run
+    # frontend/app.py ...` — it cannot route /engine/* to the engine, so
+    # the repo's sitecustomize.py (imported at interpreter start via the
+    # PYTHONPATH=. env var set on the service) MOUNTS the same /engine/media
+    # routes INSIDE Streamlit's own starlette app (additive, Streamlit's
+    # pages/static/websocket untouched) and they relay to the engine :8000
+    # exactly like deploy/render/proxy.py does. The proxy below remains the
+    # cleaner one-box option and is what a command change should adopt;
+    # embedded mode is what lets the current pinned command work too.
     #   /engine/media/{ping,upload,chunk,status} -> caption engine :8000
     #   everything else (pages, static, the /_stcore websocket) -> Streamlit :8501
-    # Big files stream browser→engine through it instead of through
-    # Streamlit's own uploader, which buffered them in RAM and OOM-killed
-    # the 512MB instance mid-upload.
     startCommand: python deploy/render/proxy.py
     healthCheckPath: /_stcore/health
     envVars:
