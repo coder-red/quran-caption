@@ -255,6 +255,7 @@ ENGINE_DOWN_DRIVE = textwrap.dedent("""
     function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
     var MAIN = __input();
     MAIN.files = [__makeFile('recitation.mp4', 'video/mp4', 40000000)];
+    window.__qcapEnginePingRetries = 0;
     __fetchBehavior = function (url) {
       if (/\\/engine\\/media\\/ping/.test(url)) { return new Error('connection refused'); }
       return { ok: true, status: 200 };
@@ -278,6 +279,7 @@ ENGINE_HTML_DRIVE = textwrap.dedent("""
     function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
     var MAIN = __input();
     MAIN.files = [__makeFile('recitation.mp4', 'video/mp4', 40000000)];
+    window.__qcapEnginePingRetries = 0;
     __fetchBehavior = function (url) {
       if (/\\/engine\\/media\\/ping/.test(url)) {
         return { ok: true, status: 200,
@@ -370,6 +372,42 @@ RESTART_ON_409_DRIVE = textwrap.dedent("""
 """)
 
 
+PING_LATE_DRIVE = textwrap.dedent("""
+    // The engine boots lazily on a cold instance; the first pings fail.
+    // The retry window must still land the pick in direct mode.
+    function assert(c, msg) { if (!c) { console.error('FAIL: ' + msg); process.exit(1); } }
+    var MAIN = __input();
+    MAIN.files = [__makeFile('recitation.mp4', 'video/mp4', 40000000)];
+    var PING = 0;
+    window.QcapProxy = {
+      buildAudioProxy: function () {
+        return Promise.resolve({
+          file: new File([new Uint8Array(2000000)], 'a.ogg', { type: 'audio/ogg' }),
+          bytes: 2000000, originalBytes: 40000000, ratio: 0.05,
+          format: 'ogg_opus', durationSec: 480
+        });
+      }
+    };
+    __fetchBehavior = function (url) {
+      if (/\\/engine\\/media\\/ping/.test(url)) {
+        PING++;
+        if (PING < 3) { return new Error('engine not up yet'); }
+        return { ok: true, status: 200, json: { ok: true } };
+      }
+      return { ok: true, status: 200 };
+    };
+    __changeHandler({ target: MAIN, stopPropagation: function () {},
+                      stopImmediatePropagation: function () {} });
+    waitFor(function () {
+      return MAIN.files && MAIN.files[0] && MAIN.files[0].name === 'caption_carrier.qcap';
+    }, function () {
+      assert(PING >= 3, 'the preflight must retry the engine, pings=' + PING);
+      var uploads = __fetchCalls.filter(function (c) { return /\\/upload/.test(c.url); });
+      assert(uploads.length >= 1, 'the direct stream must run after the engine comes up');
+      console.log(JSON.stringify({ ok: true, pings: PING }));
+    }, 4000);
+""")
+
 def _script(drive: str) -> str:
     with open(os.path.join(ROOT, "frontend", "auto_proxy.js"), encoding="utf-8") as f:
         js = f.read()
@@ -416,6 +454,11 @@ def test_small_audio_streams_raw_without_extraction(tmp_path):
 @node_only
 def test_oversized_pick_streams_nothing(tmp_path):
     assert _run(tmp_path, "toobig.js", TOO_LARGE_DRIVE)["ok"]
+
+
+@node_only
+def test_a_late_engine_still_lands_direct(tmp_path):
+    assert _run(tmp_path, "late.js", PING_LATE_DRIVE)["ok"]
 
 
 @node_only

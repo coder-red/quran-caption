@@ -140,13 +140,26 @@
   }
 
   function engineAvailable() {
-    // The engine answers with JSON; a host without the proxy answers with
-    // the app's HTML page (HTTP 200 as well), which must NOT pass here —
-    // otherwise uploads would 404 instead of falling back to the legacy path.
-    return fetch('/engine/media/ping', { method: 'GET' })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) { return !!(d && d.ok === true); })
-      .catch(function () { return false; });
+    // The engine answers with JSON; a host without the embedded routes
+    // answers with the app's HTML page (HTTP 200 as well), which must NOT
+    // pass here — otherwise uploads would 404 instead of falling back to
+    // the legacy path. A fresh instance spawns the engine lazily, so the
+    // first pings may fail while it boots; allow a short retry window.
+    var tries = Number(window.__qcapEnginePingRetries != null
+                       ? window.__qcapEnginePingRetries : 4) + 1;
+    function ping() {
+      return fetch('/engine/media/ping', { method: 'GET' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { return !!(d && d.ok === true); })
+        .catch(function () { return false; });
+    }
+    function attempt(left) {
+      return ping().then(function (ok) {
+        if (ok || left <= 1) { return ok; }
+        return sleep(2500).then(function () { return attempt(left - 1); });
+      });
+    }
+    return attempt(tries);
   }
 
   function hand(input, file) {
